@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 import argparse
 from distllm import worker_node
 import gc
@@ -7,30 +7,70 @@ import gc
 # To use this, you need: pip install bitsandbytes accelerate
 # This script loads a slice of a large model in 4-bit to save memory.
 
-def load_worker_model(model_id, layer_start, layer_end):
-    print(f"[*] Loading layers {layer_start} to {layer_end} of {model_id} in 4-bit...")
+def find_layers(model):
+    """
+    Robustly finds the transformer block list in various model architectures.
+    Supports Llama, Gemma, GPT-2, Qwen, and many others.
+    """
+    # 1. Check common Llama/Gemma style
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers
     
-    # We load the model with 4-bit quantization. 
-    # To truly save RAM, we use device_map="auto" which will handle the bitsandbytes magic.
+    # 2. Check GPT-2 style
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return model.transformer.h
+    
+    # 3. Check Qwen/Mistral style
+    if hasattr(model, "transformer") and hasattr(model.transformer, "layers"):
+        return model.transformer.layers
+    
+    # 4. Check direct layers attribute
+    if hasattr(model, "layers"):
+        return model.layers
+        
+    # 5. Generic attribute inspection for list of modules containing 'layer' or 'block'
+    for attr in ["h", "layers", "blocks"]:
+        sub_obj = getattr(model, attr, None)
+        if isinstance(sub_obj, (torch.nn.ModuleList, list)):
+            return sub_obj
+            
+    # Recursive check in model.model or model.transformer if not found
+    for sub in ["model", "transformer"]:
+        if hasattr(model, sub):
+            res = find_layers(getattr(model, sub))
+            if res is not None:
+                return res
+                
+    return None
+
+def load_worker_model(model_id, layer_start, layer_end):
+    print(f"[*] Loading model {model_id} with 4-bit quantization...")
+    
+    # Modern BitsAndBytes configuration for transformers >= 5.0.0
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True
+    )
+    
+    # To truly save RAM, we use device_map="auto"
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        load_in_4bit=True,
+        quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.float16,
         trust_remote_code=True
     )
     
-    # Extract the layer slice. 
-    # For Llama/Gemma, layers are in model.model.layers
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers[layer_start:layer_end]
-    elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        # GPT-2 style
-        layers = model.transformer.h[layer_start:layer_end]
-    else:
-        raise ValueError("Unsupported model architecture for automatic slicing.")
+    all_layers = find_layers(model)
+    if all_layers is None:
+        raise ValueError(f"Could not automatically find layers for model architecture: {type(model)}")
 
-    print(f"[v] Successfully isolated {len(layers)} layers.")
+    # Slice the layers (inclusive of layer_end as per requirements)
+    layers = all_layers[layer_start : layer_end + 1]
+
+    print(f"[v] Successfully isolated {len(layers)} layers (Index {layer_start} to {layer_end}).")
     
     # Note: We keep the full model object in memory because the layers 
     # often depend on the parent config or shared constants, but only 
@@ -51,9 +91,7 @@ def create_worker(model_id, layer_start, layer_end, role, relay_url):
         
         with torch.no_grad():
             for layer in layers:
-                # Standard HF forward pass: (hidden_states, attention_mask, position_ids, ...)
-                # We pass only hidden_states for simplicity in this MVP.
-                # Note: For production, you'd also pass the attention_mask and position_ids.
+                # Standard HF forward pass
                 outputs = layer(hidden_states)
                 hidden_states = outputs[0]
         

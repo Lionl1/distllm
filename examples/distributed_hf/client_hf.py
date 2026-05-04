@@ -15,10 +15,10 @@ Terminal 1 (Relay):
     uv run distllm relay
 
 Terminal 2 (Worker 1 - Layers 0-15):
-    uv run python worker_hf.py --role worker-1 --layer-start 0 --layer-end 16 --model-id meta-llama/Meta-Llama-3-8B
+    uv run python worker_hf.py --role worker-1 --layer-start 0 --layer-end 15 --model-id meta-llama/Meta-Llama-3-8B
 
 Terminal 3 (Worker 2 - Layers 16-31):
-    uv run python worker_hf.py --role worker-2 --layer-start 16 --layer-end 32 --model-id meta-llama/Meta-Llama-3-8B
+    uv run python worker_hf.py --role worker-2 --layer-start 16 --layer-end 31 --model-id meta-llama/Meta-Llama-3-8B
 
 Terminal 4 (This Client):
     uv run python client_hf.py --prompt "The future of distributed AI is"
