@@ -11,7 +11,7 @@ class Worker:
         self.role = role
         self.relay_url = relay_url.rstrip("/")
         self.node_id = node_id or str(uuid.uuid4())[:8]
-        self.client = httpx.AsyncClient(timeout=60.0)
+        self.client = httpx.AsyncClient(timeout=120.0)
 
     async def run(self, func: Callable):
         """Main loop for the worker node."""
@@ -81,7 +81,7 @@ class Cluster:
     """Entry point for submitting tasks and awaiting results."""
     def __init__(self, relay_url: str):
         self.relay_url = relay_url.rstrip("/")
-        self.client = httpx.AsyncClient(timeout=60.0)
+        self.client = httpx.AsyncClient(timeout=120.0)
         self.node_id = "client-" + str(uuid.uuid4())[:8]
 
     async def submit(self, role: str, payload: dict) -> str:

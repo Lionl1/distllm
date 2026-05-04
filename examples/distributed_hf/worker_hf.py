@@ -7,21 +7,27 @@ import gc
 def find_layers(model):
     """
     Exhaustively searches the model for the transformer layers ModuleList.
+    Skips vision components for VLM models like Gemma4.
     """
-    # 1. Check if the current object is the ModuleList we want
+    # 1. Prioritize language_model / text_model
+    for sub in ["language_model", "text_model", "transformer", "model"]:
+        obj = getattr(model, sub, None)
+        if obj is not None and obj != model:
+             res = find_layers(obj)
+             if res is not None:
+                 return res
+
+    # 2. Check if the current object is the ModuleList we want
     if isinstance(model, torch.nn.ModuleList) and len(model) > 0:
-        # Layers usually have 'self_attn' or 'mlp'
-        if any(hasattr(model[0], a) for a in ["self_attn", "mlp", "attention", "block"]):
+        # Check if it looks like a transformer block (has attn/mlp)
+        # AND check that it's not a small list (vision usually has fewer layers)
+        if any(hasattr(model[0], a) for a in ["self_attn", "mlp"]):
             return model
 
-    # 2. Check common attributes
-    for attr in ["h", "layers", "blocks", "layer", "block"]:
-        obj = getattr(model, attr, None)
-        if isinstance(obj, (torch.nn.ModuleList, list)) and len(obj) > 0:
-            return obj
-
-    # 3. Recursive search through all children
+    # 3. Recursive search through children, SKIPPING vision
     for name, child in model.named_children():
+        if "vision" in name.lower() or "audio" in name.lower():
+            continue
         res = find_layers(child)
         if res is not None:
             return res
@@ -48,9 +54,11 @@ def load_worker_model(model_id, layer_start, layer_end):
     
     all_layers = find_layers(model)
     if all_layers is None:
-        print(f"[!] DEBUG: Model children: {[n for n, _ in model.named_children()]}")
-        raise ValueError(f"Could not automatically find layers for model architecture: {type(model)}")
+        raise ValueError(f"Could not automatically find text layers for model architecture: {type(model)}")
 
+    print(f"[*] Found total of {len(all_layers)} layers in the model.")
+    
+    # Slice the layers
     layers = all_layers[layer_start : layer_end + 1]
     print(f"[v] Successfully isolated {len(layers)} layers (Index {layer_start} to {layer_end}).")
     return layers
