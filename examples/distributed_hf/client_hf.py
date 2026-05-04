@@ -1,95 +1,47 @@
 import torch
 import asyncio
 import argparse
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer
 from distllm import Cluster
-import os
-
-def find_norm(model):
-    """Robustly finds the final normalization layer."""
-    norm_names = ["norm", "model.norm", "language_model.norm", "transformer.ln_f"]
-    for name, module in model.named_modules():
-        if any(name.endswith(nn) for nn in norm_names):
-            return module
-    return torch.nn.Identity()
 
 async def generate(prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None):
-    print(f"[*] Initializing Memory-Optimized Client for {model_id}...")
+    print(f"[*] Initializing Thin Client (Tokenizer only)...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, token=token)
     
-    # 1. Load config only
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True, token=token)
-    
-    # 2. Create model on 'meta' device (takes 0 RAM)
-    with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-    
-    # 3. Actually load ONLY embeddings and head from the real weights
-    # Note: from_pretrained with device_map="cpu" and selective loading
-    # To keep it simple and robust, we use a lightweight approach:
-    print("[*] Loading only Embeddings and LM Head (saving RAM)...")
-    full_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16,
-        # This is the trick: we load the model but exclude the heavy 'layers'
-        # In transformers, we can't easily partially load from Hub without local cache tricks,
-        # so we load and then move to CPU only the needed parts, then delete the rest.
-        # But for 'low RAM', the best is to use 'low_cpu_mem_usage=True'
-        low_cpu_mem_usage=True,
-        device_map="cpu",
-        token=token,
-        trust_remote_code=True,
-        # We try to ignore the heavy layers if the model supports it via hooks, 
-        # but the most reliable way is to just use the full object and delete blocks.
-    )
-    
-    # Extract what we need
-    embed_tokens = full_model.get_input_embeddings()
-    lm_head = full_model.get_output_embeddings()
-    norm = find_norm(full_model)
-    
-    # IMPORTANT: Delete the heavy transformer blocks to free RAM
-    # This is a bit hacky but extremely effective for low RAM
-    for sub in ["model", "language_model", "transformer"]:
-        parent = getattr(full_model, sub, None)
-        if parent:
-            if hasattr(parent, "layers"):
-                parent.layers = torch.nn.ModuleList([]) # Empty the layers!
-            if hasattr(parent, "h"):
-                parent.h = torch.nn.ModuleList([])
-            if hasattr(parent, "blocks"):
-                parent.blocks = torch.nn.ModuleList([])
-
-    import gc
-    gc.collect()
-    print(f"[v] RAM Freed. Ready to generate.")
-
     cluster = Cluster(relay_url)
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
     
     print(f"[*] Prompt: {prompt}")
+    print(f"[*] Generating tokens via {len(worker_roles)} workers...")
+
     generated_ids = input_ids
     
     for i in range(max_new_tokens):
-        with torch.no_grad():
-            hidden_states = embed_tokens(generated_ids)
+        # 1. First worker handles input_ids -> hidden_states
+        task_1 = await cluster.submit(worker_roles[0], {"input_ids": generated_ids})
+        res = await cluster.wait_for(task_1)
+        
+        # 2. Intermediate workers handle hidden_states -> hidden_states
+        for role in worker_roles[1:-1]:
+            task = await cluster.submit(role, res)
+            res = await cluster.wait_for(task)
             
-            for role in worker_roles:
-                task = await cluster.submit(role, {"hidden_states": hidden_states})
-                result = await cluster.wait_for(task)
-                hidden_states = result["hidden_states"]
-            
-            hidden_states = norm(hidden_states)
-            logits = lm_head(hidden_states[:, -1, :])
-            
-            next_token_id = torch.argmax(logits, dim=-1).unsqueeze(0).unsqueeze(0)
-            generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
-            
-            token_text = tokenizer.decode(next_token_id[0][0])
-            print(token_text, end="", flush=True)
-            
-            if next_token_id.item() == tokenizer.eos_token_id:
-                break
+        # 3. Last worker handles hidden_states -> logits
+        if len(worker_roles) > 1:
+            task_last = await cluster.submit(worker_roles[-1], res)
+            res = await cluster.wait_for(task_last)
+        
+        logits = res["logits"]
+        
+        # Greedy Decoding
+        next_token_id = torch.argmax(logits, dim=-1).unsqueeze(0).unsqueeze(0)
+        generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
+        
+        token_text = tokenizer.decode(next_token_id[0][0])
+        print(token_text, end="", flush=True)
+        
+        if next_token_id.item() == tokenizer.eos_token_id:
+            break
 
     print("\n\n[v] Generation complete.")
     return tokenizer.decode(generated_ids[0])
