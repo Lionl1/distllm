@@ -13,8 +13,8 @@ authors = [
     { name = "Developer", email = "dev@example.com" }
 ]
 dependencies = [
-    "torch>=2.0.0",
-    "transformers>=4.30.0",
+    "torch>=2.2.0",
+    "transformers>=4.44.0",
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
     "httpx>=0.24.0",
@@ -22,6 +22,8 @@ dependencies = [
     "msgpack>=1.0.0",
     "msgpack-numpy>=0.4.8",
     "numpy>=1.24.0",
+    "accelerate>=0.33.0",
+    "bitsandbytes>=0.43.0",
 ]
 
 [project.optional-dependencies]
