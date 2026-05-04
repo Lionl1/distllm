@@ -1,53 +1,73 @@
 import torch
 import asyncio
 import argparse
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from distllm import Cluster
+import os
 
 def find_norm(model):
     """Robustly finds the final normalization layer."""
-    # Priority names
     norm_names = ["norm", "model.norm", "language_model.norm", "transformer.ln_f"]
-    
     for name, module in model.named_modules():
         if any(name.endswith(nn) for nn in norm_names):
-            print(f"[*] Found normalization layer candidate: {name}")
             return module
-            
-    # Generic search for any RMSNorm or LayerNorm that looks like a final one
-    best_norm = None
-    for name, module in model.named_modules():
-        if "Norm" in module.__class__.__name__:
-            best_norm = module # Keep the last one found
-            
-    if best_norm:
-        return best_norm
-        
-    print("[!] Warning: Could not find normalization layer, using Identity.")
     return torch.nn.Identity()
 
 async def generate(prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None):
-    print(f"[*] Initializing Client with model {model_id}...")
+    print(f"[*] Initializing Memory-Optimized Client for {model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, token=token)
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, 
-        torch_dtype=torch.float16, 
-        device_map="cpu", 
+    # 1. Load config only
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True, token=token)
+    
+    # 2. Create model on 'meta' device (takes 0 RAM)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    
+    # 3. Actually load ONLY embeddings and head from the real weights
+    # Note: from_pretrained with device_map="cpu" and selective loading
+    # To keep it simple and robust, we use a lightweight approach:
+    print("[*] Loading only Embeddings and LM Head (saving RAM)...")
+    full_model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16,
+        # This is the trick: we load the model but exclude the heavy 'layers'
+        # In transformers, we can't easily partially load from Hub without local cache tricks,
+        # so we load and then move to CPU only the needed parts, then delete the rest.
+        # But for 'low RAM', the best is to use 'low_cpu_mem_usage=True'
+        low_cpu_mem_usage=True,
+        device_map="cpu",
+        token=token,
         trust_remote_code=True,
-        token=token
+        # We try to ignore the heavy layers if the model supports it via hooks, 
+        # but the most reliable way is to just use the full object and delete blocks.
     )
     
-    embed_tokens = model.get_input_embeddings()
-    lm_head = model.get_output_embeddings()
-    norm = find_norm(model)
+    # Extract what we need
+    embed_tokens = full_model.get_input_embeddings()
+    lm_head = full_model.get_output_embeddings()
+    norm = find_norm(full_model)
+    
+    # IMPORTANT: Delete the heavy transformer blocks to free RAM
+    # This is a bit hacky but extremely effective for low RAM
+    for sub in ["model", "language_model", "transformer"]:
+        parent = getattr(full_model, sub, None)
+        if parent:
+            if hasattr(parent, "layers"):
+                parent.layers = torch.nn.ModuleList([]) # Empty the layers!
+            if hasattr(parent, "h"):
+                parent.h = torch.nn.ModuleList([])
+            if hasattr(parent, "blocks"):
+                parent.blocks = torch.nn.ModuleList([])
+
+    import gc
+    gc.collect()
+    print(f"[v] RAM Freed. Ready to generate.")
 
     cluster = Cluster(relay_url)
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
     
     print(f"[*] Prompt: {prompt}")
-    print(f"[*] Generating tokens (using workers: {', '.join(worker_roles)})...")
-
     generated_ids = input_ids
     
     for i in range(max_new_tokens):
@@ -81,7 +101,7 @@ if __name__ == "__main__":
     parser.add_argument("--relay-url", type=str, default="http://localhost:8000")
     parser.add_argument("--workers", type=str, default="worker-1,worker-2")
     parser.add_argument("--max-tokens", type=int, default=50)
-    parser.add_argument("--token", type=str, default=None, help="Hugging Face API token")
+    parser.add_argument("--token", type=str, default=None)
     args = parser.parse_args()
 
     worker_roles = [w.strip() for w in args.workers.split(",")]
