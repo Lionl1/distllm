@@ -12,30 +12,15 @@ def find_layers(model):
     Robustly finds the transformer block list in various model architectures.
     Supports Llama, Gemma, GPT-2, Qwen, and many others.
     """
-    # 1. Check common Llama/Gemma style
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return model.model.layers
-    
-    # 2. Check GPT-2 style
-    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        return model.transformer.h
-    
-    # 3. Check Qwen/Mistral style
-    if hasattr(model, "transformer") and hasattr(model.transformer, "layers"):
-        return model.transformer.layers
-    
-    # 4. Check direct layers attribute
-    if hasattr(model, "layers"):
-        return model.layers
-        
-    # 5. Generic attribute inspection for list of modules containing 'layer' or 'block'
-    for attr in ["h", "layers", "blocks"]:
+    # 1. Check common attributes directly
+    for attr in ["h", "layers", "blocks", "layer", "block"]:
         sub_obj = getattr(model, attr, None)
         if isinstance(sub_obj, (torch.nn.ModuleList, list)):
             return sub_obj
-            
-    # Recursive check in model.model or model.transformer if not found
-    for sub in ["model", "transformer"]:
+    
+    # 2. Check model.model, model.transformer, model.decoder recursively
+    # This covers cases like Llama/Gemma (model.model.layers) and others.
+    for sub in ["model", "transformer", "decoder"]:
         if hasattr(model, sub):
             res = find_layers(getattr(model, sub))
             if res is not None:
@@ -65,6 +50,8 @@ def load_worker_model(model_id, layer_start, layer_end):
     
     all_layers = find_layers(model)
     if all_layers is None:
+        # Diagnostic print to help users identify the model structure
+        print(f"[!] Could not find layers. Model structure: {model}")
         raise ValueError(f"Could not automatically find layers for model architecture: {type(model)}")
 
     # Slice the layers (inclusive of layer_end as per requirements)
