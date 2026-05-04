@@ -11,15 +11,28 @@ class Worker:
         self.role = role
         self.relay_url = relay_url.rstrip("/")
         self.node_id = node_id or str(uuid.uuid4())[:8]
+        # High timeout for unstable tunnels
         self.client = httpx.AsyncClient(timeout=120.0)
 
     async def run(self, func: Callable):
         """Main loop for the worker node."""
-        print(f"[*] Worker {self.node_id} registered as {self.role}")
+        print(f"[*] Worker {self.node_id} (Role: {self.role})")
         print(f"[*] Connecting to relay: {self.relay_url}")
         
-        # 1. Register
-        await self.client.post(f"{self.relay_url}/register", params={"node_id": self.node_id, "role": self.role})
+        # 1. Register with Retries
+        registered = False
+        while not registered:
+            try:
+                print(f"[*] Registering node...")
+                await self.client.post(
+                    f"{self.relay_url}/register", 
+                    params={"node_id": self.node_id, "role": self.role}
+                )
+                print(f"[v] Registration successful.")
+                registered = True
+            except Exception as e:
+                print(f"[!] Registration failed: {e}. Retrying in 5s...")
+                await asyncio.sleep(5)
         
         # 2. Heartbeat task
         async def heartbeat():
@@ -28,7 +41,7 @@ class Worker:
                     await self.client.post(f"{self.relay_url}/heartbeat", params={"node_id": self.node_id})
                 except Exception as e:
                     print(f"[!] Heartbeat error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(10) # Increased heartbeat interval
         
         asyncio.create_task(heartbeat())
 
@@ -40,25 +53,25 @@ class Worker:
                     task_data = unpack_payload(resp.content)
                     if task_data:
                         task_id = task_data["task_id"]
-                        
-                        # Unpack the actual payload submitted by the client
                         input_payload = unpack_payload(task_data["payload"])
                         
                         print(f"[+] Processing task {task_id}...")
                         
-                        # Execute the worker function
-                        # Supports both sync and async functions
                         if asyncio.iscoroutinefunction(func):
                             result = await func(input_payload)
                         else:
                             result = await asyncio.to_thread(func, input_payload)
                         
-                        # Pack and submit result
                         result_bytes = pack_payload(result)
                         await self.client.post(f"{self.relay_url}/result/{task_id}", content=result_bytes)
                         print(f"[v] Task {task_id} completed.")
+                elif resp.status_code == 204:
+                    pass # No tasks
+                else:
+                    print(f"[!] Relay returned status {resp.status_code}")
             except Exception as e:
                 print(f"[!] Worker loop error: {e}")
+                await asyncio.sleep(2) # Prevent rapid-fire errors
             
             await asyncio.sleep(0.5)
 
@@ -99,10 +112,12 @@ class Cluster:
         """Polls for the result of a task."""
         start_time = time.time()
         while time.time() - start_time < timeout:
-            resp = await self.client.get(f"{self.relay_url}/get_result/{task_id}")
-            if resp.status_code == 200:
-                if resp.headers.get("content-type") == "application/octet-stream":
-                    return unpack_payload(resp.content)
-            
+            try:
+                resp = await self.client.get(f"{self.relay_url}/get_result/{task_id}")
+                if resp.status_code == 200:
+                    if resp.headers.get("content-type") == "application/octet-stream":
+                        return unpack_payload(resp.content)
+            except Exception:
+                pass
             await asyncio.sleep(1)
         raise TimeoutError(f"Task {task_id} timed out.")
