@@ -20,7 +20,6 @@ def find_layers(model):
     # 2. Check if the current object is the ModuleList we want
     if isinstance(model, torch.nn.ModuleList) and len(model) > 0:
         # Check if it looks like a transformer block (has attn/mlp)
-        # AND check that it's not a small list (vision usually has fewer layers)
         if any(hasattr(model[0], a) for a in ["self_attn", "mlp"]):
             return model
 
@@ -34,7 +33,7 @@ def find_layers(model):
                 
     return None
 
-def load_worker_model(model_id, layer_start, layer_end):
+def load_worker_model(model_id, layer_start, layer_end, token=None):
     print(f"[*] Loading model {model_id} with 4-bit quantization...")
     
     bnb_config = BitsAndBytesConfig(
@@ -49,7 +48,8 @@ def load_worker_model(model_id, layer_start, layer_end):
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.float16,
-        trust_remote_code=True
+        trust_remote_code=True,
+        token=token
     )
     
     all_layers = find_layers(model)
@@ -63,8 +63,8 @@ def load_worker_model(model_id, layer_start, layer_end):
     print(f"[v] Successfully isolated {len(layers)} layers (Index {layer_start} to {layer_end}).")
     return layers
 
-def create_worker(model_id, layer_start, layer_end, role, relay_url):
-    layers = load_worker_model(model_id, layer_start, layer_end)
+def create_worker(model_id, layer_start, layer_end, role, relay_url, token=None):
+    layers = load_worker_model(model_id, layer_start, layer_end, token=token)
 
     @worker_node(role=role, relay_url=relay_url)
     def process_layers(payload):
@@ -91,7 +91,8 @@ if __name__ == "__main__":
     parser.add_argument("--layer-end", type=int, required=True)
     parser.add_argument("--role", type=str, required=True)
     parser.add_argument("--relay-url", type=str, default="http://localhost:8000")
+    parser.add_argument("--token", type=str, default=None, help="Hugging Face API token")
     args = parser.parse_args()
 
-    worker = create_worker(args.model_id, args.layer_start, args.layer_end, args.role, args.relay_url)
+    worker = create_worker(args.model_id, args.layer_start, args.layer_end, args.role, args.relay_url, args.token)
     worker.start()

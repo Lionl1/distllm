@@ -26,15 +26,16 @@ def find_norm(model):
     print("[!] Warning: Could not find normalization layer, using Identity.")
     return torch.nn.Identity()
 
-async def generate(prompt, model_id, relay_url, worker_roles, max_new_tokens=50):
+async def generate(prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None):
     print(f"[*] Initializing Client with model {model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, token=token)
     
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
         torch_dtype=torch.float16, 
         device_map="cpu", 
-        trust_remote_code=True
+        trust_remote_code=True,
+        token=token
     )
     
     embed_tokens = model.get_input_embeddings()
@@ -80,7 +81,8 @@ if __name__ == "__main__":
     parser.add_argument("--relay-url", type=str, default="http://localhost:8000")
     parser.add_argument("--workers", type=str, default="worker-1,worker-2")
     parser.add_argument("--max-tokens", type=int, default=50)
+    parser.add_argument("--token", type=str, default=None, help="Hugging Face API token")
     args = parser.parse_args()
 
     worker_roles = [w.strip() for w in args.workers.split(",")]
-    asyncio.run(generate(args.prompt, args.model_id, args.relay_url, worker_roles, args.max_tokens))
+    asyncio.run(generate(args.prompt, args.model_id, args.relay_url, worker_roles, args.max_tokens, args.token))
