@@ -1,0 +1,9 @@
+torch
+transformers
+fastapi
+uvicorn
+httpx
+typer
+msgpack
+msgpack-numpy
+numpy
