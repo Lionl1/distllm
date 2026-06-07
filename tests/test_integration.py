@@ -11,6 +11,10 @@ def my_worker(payload):
     x = payload["x"]
     return {"y": x + 1}
 
+@worker_node(role="failing-worker", relay_url="http://localhost:8002")
+def my_failing_worker(payload):
+    raise ValueError("simulated processing error")
+
 def run_relay():
     import uvicorn
     from distllm.relay import app
@@ -18,6 +22,9 @@ def run_relay():
 
 def run_worker():
     my_worker.start(node_id="W-INT")
+
+def run_failing_worker():
+    my_failing_worker.start(node_id="W-FAIL")
 
 @pytest.fixture(scope="module")
 def relay_server():
@@ -46,5 +53,27 @@ async def test_full_integration(relay_server):
         
         assert torch.equal(result["y"], torch.tensor([11, 21]))
         
+    finally:
+        p_worker.terminate()
+
+@pytest.mark.asyncio
+async def test_failing_worker_integration(relay_server):
+    # Start failing worker in a separate process
+    p_worker = multiprocessing.Process(target=run_failing_worker)
+    p_worker.start()
+    
+    try:
+        await asyncio.sleep(3) # Wait for worker registration
+        
+        async with Cluster(relay_server) as cluster:
+            # Submit task
+            task_id = await cluster.submit("failing-worker", {"x": 10})
+            
+            # Wait for result, expect it to raise RuntimeError
+            with pytest.raises(RuntimeError) as exc_info:
+                await cluster.wait_for(task_id, timeout=10)
+            
+            assert "Task failed on worker: simulated processing error" in str(exc_info.value)
+            
     finally:
         p_worker.terminate()

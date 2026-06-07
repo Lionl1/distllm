@@ -82,3 +82,58 @@ async def test_task_timeout_and_recovery():
     # Verify it is PENDING again
     resp = client.get(f"/get_result/{task_id}")
     assert resp.json()["status"] == "PENDING"
+
+def test_task_failure():
+    # 1. Register worker
+    client.post("/register", params={"node_id": "worker-err", "role": "buggy"})
+    
+    # 2. Submit task
+    payload = {"data": "broken"}
+    submit_resp = client.post(
+        "/submit",
+        content=pack_payload(payload),
+        params={"target_role": "buggy", "sender_id": "client-err"}
+    )
+    task_id = submit_resp.json()["task_id"]
+    
+    # 3. Poll task
+    client.get("/poll/buggy", params={"worker_id": "worker-err"})
+    
+    # 4. Report failure
+    fail_resp = client.post(f"/fail/{task_id}", params={"error_msg": "something went wrong"})
+    assert fail_resp.status_code == 200
+    
+    # 5. Check result status and error message
+    get_res_resp = client.get(f"/get_result/{task_id}")
+    assert get_res_resp.status_code == 200
+    res_json = get_res_resp.json()
+    assert res_json["status"] == "FAILED"
+    assert res_json["error"] == "something went wrong"
+
+def test_deregistration():
+    # 1. Register worker
+    client.post("/register", params={"node_id": "worker-dereg", "role": "cleanup"})
+    
+    # 2. Submit task
+    payload = {"data": "cleanup-test"}
+    submit_resp = client.post(
+        "/submit",
+        content=pack_payload(payload),
+        params={"target_role": "cleanup", "sender_id": "client-dereg"}
+    )
+    task_id = submit_resp.json()["task_id"]
+    
+    # 3. Assign task to worker
+    client.get("/poll/cleanup", params={"worker_id": "worker-dereg"})
+    
+    # Verify it is ASSIGNED
+    resp = client.get(f"/get_result/{task_id}")
+    assert resp.json()["status"] == "ASSIGNED"
+    
+    # 4. Deregister worker
+    dereg_resp = client.post("/deregister", params={"node_id": "worker-dereg"})
+    assert dereg_resp.status_code == 200
+    
+    # Verify the task is PENDING again immediately
+    resp = client.get(f"/get_result/{task_id}")
+    assert resp.json()["status"] == "PENDING"

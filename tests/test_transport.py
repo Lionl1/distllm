@@ -27,3 +27,22 @@ def test_payload_serialization():
     assert unpacked["id"] == "test-123"
     assert torch.allclose(unpacked["data"], payload["data"])
     assert torch.equal(unpacked["nested"]["val"], payload["nested"]["val"])
+
+def test_bfloat16_serialization():
+    # Test direct bf16 tensor
+    original = torch.tensor([1.5, 2.5, 3.5], dtype=torch.bfloat16)
+    packed = pack_tensor(original)
+    unpacked = unpack_tensor(packed)
+    
+    assert torch.equal(original, unpacked)
+    assert unpacked.dtype == torch.bfloat16
+
+    # Test bf16 tensor inside a payload dict
+    payload = {
+        "x": torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+    }
+    packed = pack_payload(payload)
+    unpacked = unpack_payload(packed)
+    
+    assert torch.equal(payload["x"], unpacked["x"])
+    assert unpacked["x"].dtype == torch.bfloat16
