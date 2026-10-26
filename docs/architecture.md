@@ -129,8 +129,9 @@ doubled the traffic; it is still decoded). Only a whitelist of dtypes is accepte
 4. Recreate non-persistent buffers (rotary `inv_freq`) on the device; drop modules the
    stage does not need; fail loudly if anything is left on `meta`.
 
-`dtype="auto"`: CPU → float32; CUDA → bfloat16 for bf16 checkpoints on GPUs that support
-it, float16 otherwise.
+`device="auto"`: CUDA, then MPS (Apple Silicon), then CPU. `dtype="auto"`: CPU → float32;
+MPS → float16; CUDA → bfloat16 for bf16 checkpoints on GPUs that support it, float16
+otherwise.
 
 ### Stage protocol: `PipelineStage.handle(payload)`
 

@@ -140,3 +140,15 @@ The quantized output is identical to quantizing the same model with transformers
 quality loss is the quantization's: a 0.5B model is very sensitive — greedy decoding
 diverges from float32 within a few tokens. Larger models tolerate nf4 much better; measure
 on yours: `uv run --extra quantization python benchmarks/bench_quantization.py --model-id ...`.
+
+## Apple Silicon GPU (MPS)
+
+Same laptop, two stages in one process (no relay), 32 greedy tokens after a warm-up, best of
+two runs:
+
+| model | CPU float32, tok/s | MPS float16, tok/s | output vs CPU float32 |
+|---|---:|---:|---|
+| Qwen/Qwen2.5-0.5B | 12.5 | 20.6 | identical (16/16 tokens checked) |
+| HuggingFaceTB/SmolLM2-360M | 14.8 | 20.0 | identical (16/16 tokens checked) |
+
+bfloat16 on MPS drifted from float32 after 6–11 tokens, so `dtype="auto"` uses float16 there.

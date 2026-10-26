@@ -43,7 +43,7 @@ for tasks assigned to it; it cannot submit tasks or read other sessions' results
 |---|---|---|
 | NVIDIA GPU (CUDA) | main target | `--device auto` picks it; bf16 for bf16 checkpoints on Ampere+ (RTX 30xx/40xx, A100…), fp16 otherwise; `--quantize nf4/int8` works |
 | CPU (x86, ARM) | tested | slow, but fine for small models and for thin first/last stages; float32 by default |
-| Apple Silicon (MPS) | untested | not chosen by `auto` (falls back to CPU); try `--device mps`; bitsandbytes quantization does not run on MPS |
+| Apple Silicon (MPS) | tested | chosen by `auto` when there is no CUDA, float16 (matched float32 output exactly in our checks; bf16 drifted); bitsandbytes quantization does not run on MPS |
 | AMD (ROCm) / Intel GPUs | untested | PyTorch ROCm builds expose the GPU as `cuda` and may just work; no guarantees |
 
 Stages on different hardware can be mixed: each stage converts incoming hidden states to

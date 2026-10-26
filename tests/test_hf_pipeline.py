@@ -338,3 +338,32 @@ def test_auto_dtype_on_cuda(monkeypatch, checkpoint_dtype, bf16_supported, expec
     assert _resolve_dtype("auto", torch.device("cuda"), config) == expected
     assert _resolve_dtype("auto", torch.device("cpu"), config) == torch.float32
     assert _resolve_dtype("float16", torch.device("cpu"), config) == torch.float16
+
+
+def test_auto_device_prefers_cuda_then_mps(monkeypatch):
+    from distllm.hf import _resolve_device, _resolve_dtype
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    assert _resolve_device("auto").type == "mps"
+    assert _resolve_dtype("auto", torch.device("mps")) == torch.float16
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    assert _resolve_device("auto").type == "cpu"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert _resolve_device("auto").type == "cuda"
+    assert _resolve_device("cpu").type == "cpu"
+
+
+def test_quantize_on_mps_is_rejected(monkeypatch):
+    with pytest.raises(ValueError, match="MPS"):
+        load_stage(MODELS[0], 0, 0, device="mps", quantize="nf4")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Apple Silicon")
+async def test_pipeline_runs_on_mps():
+    stages = [load_stage(MODELS[0], i, i, device="mps", dtype="float32") for i in range(2)]
+    call, roles = _direct_call(stages)
+    expected = _reference_greedy(MODELS[0], PROMPT, NEW_TOKENS)
+    result = await PipelineGenerator(call, roles).generate(PROMPT, NEW_TOKENS)
+    assert result.token_ids == expected
