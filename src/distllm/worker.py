@@ -5,10 +5,19 @@ import time
 import httpx
 import functools
 from typing import Callable, Optional
+from .crypto import PayloadDecryptionError, cipher_from, is_sealed
 from .transport import pack_payload, unpack_payload
 
 def _auth_headers(token: Optional[str]) -> dict:
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _open(cipher, data: bytes) -> bytes:
+    if cipher:
+        return cipher.open(data)
+    if is_sealed(data):
+        raise PayloadDecryptionError("Payload is encrypted: set DISTLLM_PAYLOAD_KEY")
+    return data
 
 
 class RelayAuthError(PermissionError):
@@ -30,11 +39,13 @@ class Worker:
         max_batch: int = 1,
         batched: bool = False,
         heartbeat_interval: Optional[float] = None,
+        payload_key: Optional[str] = None,
     ):
         """``max_batch > 1`` takes up to that many queued tasks per poll. With
         ``batched=True`` the function receives a list of payloads and returns a list of
         results (an Exception instance marks a failed item); otherwise the tasks run one
-        by one."""
+        by one. ``payload_key`` (else ``$DISTLLM_PAYLOAD_KEY``) turns on end-to-end
+        encryption of payloads; clients and workers must share it."""
         self.role = role
         self.max_batch = max(1, max_batch)
         self.batched = batched
@@ -50,6 +61,14 @@ class Worker:
         token = token or os.environ.get("DISTLLM_WORKER_TOKEN") or os.environ.get("DISTLLM_TOKEN")
         # High timeout for unstable tunnels
         self.client = httpx.AsyncClient(timeout=120.0, headers=_auth_headers(token))
+        self.cipher = cipher_from(payload_key)
+
+    def _decode(self, data: bytes):
+        """A task payload, or the exception that makes it unusable (reported as the task's failure)."""
+        try:
+            return unpack_payload(_open(self.cipher, data))
+        except Exception as e:
+            return e
 
     async def register(self):
         """Registers the worker node with the relay, retrying if necessary."""
@@ -83,6 +102,13 @@ class Worker:
 
     async def _process(self, func: Callable, tasks: list) -> None:
         """Run tasks (one, or a batch with ``batched=True``) and upload every outcome."""
+        # Payloads that could not be decoded fail on their own; the rest run.
+        bad = {task_id: payload for task_id, payload in tasks if isinstance(payload, Exception)}
+        if bad:
+            await asyncio.gather(*(self._report(task_id, error) for task_id, error in bad.items()))
+            tasks = [(task_id, payload) for task_id, payload in tasks if task_id not in bad]
+            if not tasks:
+                return
         ids = ", ".join(task_id for task_id, _ in tasks)
         print(f"[+] Processing {ids}...")
         if self.batched:
@@ -107,6 +133,8 @@ class Worker:
         if not isinstance(result, Exception):
             try:
                 body = pack_payload(result)
+                if self.cipher:
+                    body = self.cipher.seal(body)
             except Exception as e:  # unserializable result
                 result = e
         if isinstance(result, Exception):
@@ -184,7 +212,7 @@ class Worker:
                     if resp.status_code == 200:
                         data = unpack_payload(resp.content)
                         items = data["tasks"] if "tasks" in data else [data]
-                        tasks = [(item["task_id"], unpack_payload(item["payload"])) for item in items]
+                        tasks = [(item["task_id"], self._decode(item["payload"])) for item in items]
                         await self._process(func, tasks)
                     elif resp.status_code == 204:
                         pass # No tasks
@@ -226,6 +254,7 @@ def worker_node(
     token: Optional[str] = None,
     max_batch: int = 1,
     batched: bool = False,
+    payload_key: Optional[str] = None,
 ):
     """Decorator to turn a function into a distributed worker."""
     def decorator(func):
@@ -236,7 +265,7 @@ def worker_node(
         def _worker(node_id: str = None, idle_sleep: float = 0.0) -> Worker:
             return Worker(
                 role=role, relay_url=relay_url, node_id=node_id, idle_sleep=idle_sleep, token=token,
-                max_batch=max_batch, batched=batched,
+                max_batch=max_batch, batched=batched, payload_key=payload_key,
             )
 
         def start(node_id: str = None, idle_sleep: float = 0.0):
@@ -267,10 +296,18 @@ class Cluster:
     """
     LONG_POLL_WAIT = 30.0
 
-    def __init__(self, relay_url: str, poll_interval: Optional[float] = None, token: Optional[str] = None):
+    def __init__(
+        self,
+        relay_url: str,
+        poll_interval: Optional[float] = None,
+        token: Optional[str] = None,
+        payload_key: Optional[str] = None,
+    ):
+        """``payload_key`` (else ``$DISTLLM_PAYLOAD_KEY``): encrypt payloads end to end."""
         self.relay_url = relay_url.rstrip("/")
         token = token or os.environ.get("DISTLLM_TOKEN")
         self.client = httpx.AsyncClient(timeout=120.0, headers=_auth_headers(token))
+        self.cipher = cipher_from(payload_key)
         self.node_id = "client-" + str(uuid.uuid4())[:8]
         self.poll_interval = poll_interval
 
@@ -296,6 +333,8 @@ class Cluster:
         check start_pos.
         """
         data = pack_payload(payload)
+        if self.cipher:
+            data = self.cipher.seal(data)
         params = {"target_role": role, "sender_id": self.node_id}
         if route:
             params["route"] = ",".join(route)
@@ -346,7 +385,7 @@ class Cluster:
                     continue
                 if resp.status_code == 200:
                     if resp.headers.get("content-type") == "application/octet-stream":
-                        return unpack_payload(resp.content)
+                        return unpack_payload(_open(self.cipher, resp.content))
                     try:
                         data = resp.json()
                     except ValueError:

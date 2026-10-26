@@ -175,6 +175,8 @@ result = await generator.generate(input_ids, 50, sampling=SamplingParams(tempera
 - Replicas of a stage role are supported: the relay keeps each session on the replica that
   holds its KV cache and moves it (with a replay) only when that worker is gone. Replicas do
   not share load within one session.
+- End-to-end encryption (`DISTLLM_PAYLOAD_KEY`) hides payloads from the relay and the
+  network, not from the workers that compute on them.
 - The relay keeps its state in memory: a relay restart loses in-flight tasks (clients recover
   by replaying the prefix, but tasks queued for workers that are still loading are lost).
 - CI runs the full test suite and the Rust relay on Linux, macOS and Windows (CPU; Apple MPS

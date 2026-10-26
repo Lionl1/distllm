@@ -46,5 +46,12 @@ def worker(
     worker_inst = Worker(role=role, relay_url=relay_url, node_id=node_id, token=token)
     asyncio.run(worker_inst.run(echo_worker))
 
+@app.command()
+def keygen():
+    """Prints a random key for end-to-end payload encryption (DISTLLM_PAYLOAD_KEY)."""
+    from .crypto import generate_key
+
+    typer.echo(generate_key())
+
 if __name__ == "__main__":
     app()
