@@ -145,8 +145,9 @@ computes differently.
 
 ## Limitations
 
-- Batch size 1. Sampling (temperature, top-k, top-p, seed) for `PipelineGenerator`;
-  speculative decoding is greedy only.
+- One sequence per session; concurrent sessions are batched per stage for decode steps
+  (prefill runs one by one). Sampling (temperature, top-k, top-p, seed) for
+  `PipelineGenerator`; speculative decoding is greedy only.
 - Decoder-only `*ForCausalLM` checkpoints whose tensor names match the model (Llama,
   Qwen2/2.5/3, Mistral, SmolLM, ...); multimodal checkpoints are rejected with a clear error.
 - Quantization: bitsandbytes nf4/fp4/int8 (no GPTQ/AWQ checkpoints).

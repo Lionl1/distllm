@@ -145,8 +145,10 @@ tokenizer).
   on any machine). Either way the client replays the prefix and continues with the same
   output. Nothing to restart on your side.
 - **Several people generating at once** works — each session has its own KV cache on
-  every stage (8 sessions per stage by default) — but a worker computes one request at a
-  time, so users slow each other down. There is no batching yet.
+  every stage (8 sessions per stage by default), and workers batch the decode steps of
+  concurrent sessions into one forward (`--max-batch`, default 8): on an Apple GPU 8
+  sessions gave 2.8× the throughput of running them one by one. Prompts (prefill) still run
+  one at a time.
 - **Several friends may serve the same role** (replicas): the relay keeps each session on
   the replica that holds its KV cache, so different sessions spread over replicas without
   replays. If that friend leaves, the session moves to another replica (one replay).
