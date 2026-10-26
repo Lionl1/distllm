@@ -75,8 +75,9 @@ uv run python examples/distributed_hf/client_hf.py --model-id Qwen/Qwen2.5-0.5B 
 # than the target, e.g. target Qwen/Qwen2.5-7B with --draft-model-id Qwen/Qwen2.5-0.5B
 ```
 
-Workers use CUDA when available (bf16 for bf16 checkpoints on Ampere+, fp16 otherwise) and
-CPU float32 otherwise; `--device`, `--dtype` and `--quantize nf4|fp4|int8` override it.
+Workers pick CUDA when available (bf16 for bf16 checkpoints on Ampere+, fp16 otherwise),
+then Apple Silicon GPUs (MPS, fp16), then CPU (float32); `--device`, `--dtype` and
+`--quantize nf4|fp4|int8` override it (quantization needs CUDA or CPU).
 
 ### From Python
 
@@ -150,7 +151,8 @@ async with Cluster("http://relay:8000") as cluster:
   not share load within one session.
 - The relay keeps its state in memory: a relay restart loses in-flight tasks (clients recover
   by replaying the prefix, but tasks queued for workers that are still loading are lost).
-- Tested on CPU (macOS/Linux); GPU paths (CUDA, bitsandbytes on CUDA) are not covered by CI.
+- Tested on CPU (macOS/Linux) and Apple MPS; CUDA paths (incl. bitsandbytes on CUDA) are not
+  covered by CI.
 
 ## Development
 

@@ -42,6 +42,8 @@ def _resolve_device(device: Optional[str]) -> torch.device:
         return torch.device(device)
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")  # Apple Silicon GPU
     return torch.device("cpu")
 
 
@@ -54,6 +56,9 @@ def _checkpoint_dtype(config: Any) -> Optional[torch.dtype]:
 
 def _resolve_dtype(dtype: Optional[str], device: torch.device, config: Any = None) -> torch.dtype:
     if dtype is None or dtype == "auto":
+        if device.type == "mps":
+            # fp16 on MPS matched float32 output exactly in our checks; bf16 drifted.
+            return torch.float16
         if device.type != "cuda":
             return torch.float32  # fp16/bf16 matmuls are slow or unsupported on CPU
         # Models trained in bf16 (Qwen2.5, Llama 3, ...) can overflow in fp16 and produce
@@ -203,6 +208,8 @@ def load_stage(
 
     torch_device = _resolve_device(device)
     torch_dtype = _resolve_dtype(dtype, torch_device, config)
+    if quantize is not None and torch_device.type == "mps":
+        raise ValueError("bitsandbytes quantization does not run on MPS: use device='cpu' or drop quantize")
     stage_config = _stage_config(config, layer_start, layer_end)
 
     with torch.device("meta"):

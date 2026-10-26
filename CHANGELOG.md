@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Apple Silicon: `device="auto"` picks MPS after CUDA, with float16; quantization on MPS
+  is rejected with a clear error.
 - Session affinity for replicas: tasks of a session go to the worker of each role that
   holds its KV cache (`?session=`, set by `Cluster` from `session_id`); re-bound when that
   worker is gone.
