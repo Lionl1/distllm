@@ -6,12 +6,12 @@ import asyncio
 from transformers import AutoTokenizer
 
 from distllm import Cluster
-from distllm.hf import PipelineGenerator, SpeculativeGenerator
+from distllm.hf import PipelineGenerator, SamplingParams, SpeculativeGenerator
 
 
 async def generate(
     prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None,
-    route=False, draft_model_id=None, speculative_k=4, relay_token=None,
+    route=False, draft_model_id=None, speculative_k=4, relay_token=None, sampling=None,
 ):
     print("[*] Initializing Thin Client (Tokenizer only)...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
@@ -22,6 +22,9 @@ async def generate(
 
     async with Cluster(relay_url, token=relay_token) as cluster:
         route_call = cluster.call_route if route else None
+        sampling = sampling or SamplingParams()
+        if draft_model_id and not sampling.greedy:
+            raise SystemExit("speculative decoding is greedy-only: drop --temperature or --draft-model-id")
         if draft_model_id:
             from transformers import AutoModelForCausalLM
 
@@ -32,11 +35,13 @@ async def generate(
             )
         else:
             generator = PipelineGenerator(cluster.call, worker_roles, route_call=route_call)
+        extra = {} if draft_model_id else {"sampling": sampling}
         result = await generator.generate(
             input_ids,
             max_new_tokens,
             eos_token_id=tokenizer.eos_token_id,
             on_token=lambda tid: print(tokenizer.decode([tid]), end="", flush=True),
+            **extra,
         )
 
     print("\n\n[v] Generation complete.")
@@ -62,6 +67,10 @@ if __name__ == "__main__":
     parser.add_argument("--draft-model-id", type=str, default=None,
                         help="small model with the same tokenizer for speculative decoding")
     parser.add_argument("--speculative-k", type=int, default=4)
+    parser.add_argument("--temperature", type=float, default=0.0, help="0 = greedy")
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     worker_roles = [w.strip() for w in args.workers.split(",")]
@@ -69,4 +78,5 @@ if __name__ == "__main__":
         args.prompt, args.model_id, args.relay_url, worker_roles, args.max_tokens, args.token,
         route=args.route, draft_model_id=args.draft_model_id, speculative_k=args.speculative_k,
         relay_token=args.relay_token,
+        sampling=SamplingParams(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, seed=args.seed),
     ))
