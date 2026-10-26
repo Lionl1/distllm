@@ -159,8 +159,8 @@ computes differently.
   not share load within one session.
 - The relay keeps its state in memory: a relay restart loses in-flight tasks (clients recover
   by replaying the prefix, but tasks queued for workers that are still loading are lost).
-- Tested on CPU (macOS/Linux) and Apple MPS; CUDA paths (incl. bitsandbytes on CUDA) are not
-  covered by CI.
+- CI runs the full test suite and the Rust relay on Linux, macOS and Windows (CPU; Apple MPS
+  checked locally). CUDA paths (incl. bitsandbytes on CUDA) are not covered: CI has no GPU.
 
 ## Development
 
