@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- CI on Linux, macOS and Windows for the Python tests and the Rust relay.
 - Model revision pinning: `load_stage(..., revision=)`, `resolve_revision()`, `--revision` in
   the examples; `plan_split.py` pins the current commit in every command it prints.
 - Rust relay (`relay-rs/`, axum + tokio): drop-in replacement with the same protocol;

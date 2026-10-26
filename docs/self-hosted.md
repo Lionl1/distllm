@@ -48,8 +48,15 @@ for tasks assigned to it; it cannot submit tasks or read other sessions' results
 | Apple Silicon (MPS) | tested | chosen by `auto` when there is no CUDA, float16 (matched float32 output exactly in our checks; bf16 drifted); bitsandbytes quantization does not run on MPS |
 | AMD (ROCm) / Intel GPUs | untested | PyTorch ROCm builds expose the GPU as `cuda` and may just work; no guarantees |
 
-Stages on different hardware can be mixed: each stage converts incoming hidden states to
-its own dtype.
+Operating systems: Linux, macOS and Windows — CI runs all tests (Python 3.10/3.12, CPU,
+bitsandbytes included) and builds and tests the Rust relay on each of them.
+
+Stages on different machines can be mixed freely — Windows, macOS and Linux, GPU and CPU,
+fp16 and bf16 in one pipeline: each stage converts incoming hidden states to its own dtype,
+and the tiny numeric differences stay within the audit tolerance. Tensors travel as raw
+little-endian bytes, which covers every mainstream CPU (x86, ARM, Apple); big-endian
+machines (e.g. IBM s390x) are not supported. Two things must match on all machines: the
+**model revision** (below) and the **distllm version**.
 
 ## 3. Split the model
 
