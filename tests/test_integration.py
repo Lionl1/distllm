@@ -99,7 +99,7 @@ async def test_hf_pipeline_over_relay(relay_server):
     """Two stage processes behind the relay generate exactly what the full model does."""
     pytest.importorskip("transformers")
     from transformers import AutoModelForCausalLM
-    from distllm.hf import PipelineGenerator
+    from distllm.hf import PipelineGenerator, SpeculativeGenerator
 
     prompt = torch.tensor([[1, 5, 9, 13, 21, 34, 55]])
     model = AutoModelForCausalLM.from_pretrained(TINY_LLAMA, dtype=torch.float32).eval()
@@ -124,8 +124,14 @@ async def test_hf_pipeline_over_relay(relay_server):
             result = await asyncio.wait_for(generator.generate(prompt, 6), timeout=120)
             routed = PipelineGenerator(cluster.call, roles, route_call=cluster.call_route)
             routed_result = await asyncio.wait_for(routed.generate(prompt, 6), timeout=60)
+            speculative = SpeculativeGenerator(
+                cluster.call, roles, model, k=3, route_call=cluster.call_route
+            )
+            speculative_result = await asyncio.wait_for(speculative.generate(prompt, 6), timeout=60)
         assert result.token_ids == expected
         assert routed_result.token_ids == expected
+        assert speculative_result.token_ids == expected
+        assert speculative_result.rounds < 6
     finally:
         for p in workers:
             p.terminate()

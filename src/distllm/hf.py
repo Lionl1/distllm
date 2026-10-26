@@ -226,10 +226,18 @@ class PipelineStage:
     Protocol (``handle`` payload):
       - ``session_id``: str, ``start_pos``: int — position of the first new token;
       - ``input_ids`` (first stage) or ``hidden_states`` (other stages) for the new tokens;
+      - ``rewind``: True — allow ``start_pos`` below the cached length: the cache is
+        cropped to ``start_pos`` first (speculative decoding drops rejected tokens);
+      - ``output``: ``"logits"`` (default, last-token logits) or ``"argmax"``
+        (greedy token id for *every* new position, for draft verification);
       - ``close``: True — drop the session cache.
     ``start_pos == 0`` always starts a fresh cache. Any other ``start_pos`` must equal
-    the cached length, otherwise the stage answers ``{"cache_miss": True}``.
+    the cached length (or be lower with ``rewind``), otherwise the stage answers
+    ``{"cache_miss": True}``. Intermediate stages return a ready payload for the next
+    stage: the same control fields plus ``hidden_states``.
     """
+
+    CONTROL_KEYS = ("session_id", "start_pos", "rewind", "output")
 
     def __init__(
         self,
@@ -290,7 +298,10 @@ class PipelineStage:
             sess = self._sessions.get(session_id)
             if start_pos == 0:
                 sess = _Session(cache=DynamicCache(config=self.config), length=0)
-            elif sess is None or sess.length != start_pos:
+            elif sess is not None and payload.get("rewind") and start_pos < sess.length:
+                sess.cache.crop(start_pos)
+                sess.length = start_pos
+            if start_pos != 0 and (sess is None or sess.length != start_pos):
                 # stop_chain: the relay must not forward this answer to the next stage.
                 return {"cache_miss": True, "cached": sess.length if sess else 0, "stop_chain": True}
 
@@ -318,16 +329,15 @@ class PipelineStage:
                     use_cache=True,
                 )
                 hidden = out.last_hidden_state
-                if self.is_last:
+                if self.is_last and payload.get("output") == "argmax":
+                    result = {"argmax": self.model.lm_head(hidden[0]).argmax(dim=-1).cpu()}
+                elif self.is_last:
                     result = {"logits": self.model.lm_head(hidden[:, -1, :]).float().cpu()}
                 else:
                     # The output is a ready payload for the next stage, so the relay can
                     # forward it as is (chained routes).
-                    result = {
-                        "session_id": session_id,
-                        "start_pos": start_pos,
-                        "hidden_states": hidden.cpu(),
-                    }
+                    result = {k: payload[k] for k in self.CONTROL_KEYS if k in payload}
+                    result["hidden_states"] = hidden.cpu()
 
             sess.length = start_pos + new_tokens
             sess.last_used = time.time()
@@ -482,3 +492,206 @@ class PipelineGenerator:
                 await self.call(role, {"session_id": session_id, "close": True})
             except Exception:  # noqa: BLE001 — cleanup is best-effort, caches also expire by TTL
                 pass
+
+
+# --------------------------------------------------------------------------- #
+# Speculative decoding: a local draft model proposes, the pipeline verifies
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class SpeculativeResult(GenerationResult):
+    rounds: int = 0
+    proposed_draft_tokens: int = 0
+    accepted_draft_tokens: int = 0
+
+    @property
+    def acceptance_rate(self) -> float:
+        return self.accepted_draft_tokens / self.proposed_draft_tokens if self.proposed_draft_tokens else 0.0
+
+    @property
+    def tokens_per_round(self) -> float:
+        return len(self.token_ids) / self.rounds if self.rounds else 0.0
+
+
+class _DraftModel:
+    """Full small model on the client with its own KV cache."""
+
+    def __init__(self, model: Any) -> None:
+        from transformers import DynamicCache
+
+        self.model = model.eval()
+        self.device = next(model.parameters()).device
+        self.cache = DynamicCache(config=model.config)
+        self.length = 0
+
+    def propose(self, sequence: torch.Tensor, k: int) -> list[int]:
+        """Greedy k tokens continuing ``sequence``; reuses the cache for the common prefix."""
+        # The caller always appends at least one token (the target's bonus token) between
+        # rounds, so there is something new to feed; keep one token if it ever isn't.
+        keep = min(self.length, sequence.shape[1] - 1)
+        if self.length > keep:
+            self.cache.crop(keep)
+            self.length = keep
+        proposed: list[int] = []
+        new = sequence[:, self.length:].to(self.device)
+        with torch.inference_mode():
+            for _ in range(k):
+                logits = self.model(new, past_key_values=self.cache, use_cache=True).logits
+                self.length += new.shape[1]
+                token = int(logits[0, -1].argmax())
+                proposed.append(token)
+                new = torch.tensor([[token]], device=self.device)
+        # The last proposed token was not fed: the cache covers sequence + proposed[:-1].
+        return proposed
+
+    def accept(self, valid_length: int) -> None:
+        if self.length > valid_length:
+            self.cache.crop(valid_length)
+            self.length = valid_length
+
+
+class SpeculativeGenerator:
+    """Greedy speculative decoding over pipeline stages.
+
+    Each round the local ``draft_model`` (same tokenizer, much smaller) proposes
+    ``k`` tokens; the pipeline runs the pending token plus all proposals in one pass
+    and returns the target model's greedy choice at every position. The longest
+    agreeing prefix is accepted plus one token from the target, rejected positions
+    are cropped from the stage caches with ``rewind``. The output is exactly what
+    greedy decoding with the target model produces, but one pipeline round trip
+    yields up to ``k + 1`` tokens.
+    """
+
+    def __init__(
+        self,
+        call: CallFn,
+        roles: list[str],
+        draft_model: Any,
+        *,
+        k: int = 4,
+        route_call: Optional[RouteCallFn] = None,
+        max_recoveries_per_step: int = 2,
+    ) -> None:
+        if k < 1:
+            raise ValueError("k must be >= 1")
+        self.pipeline = PipelineGenerator(
+            call, roles, route_call=route_call, max_recoveries_per_step=max_recoveries_per_step
+        )
+        self.draft = _DraftModel(draft_model)
+        self.k = k
+        self.max_recoveries_per_step = max_recoveries_per_step
+
+    async def _verify(self, session_id: str, start_pos: int, tokens: torch.Tensor) -> Optional[torch.Tensor]:
+        payload: dict = {
+            "session_id": session_id,
+            "start_pos": start_pos,
+            "rewind": True,
+            "output": "argmax",
+            "input_ids": tokens,
+        }
+        pipeline = self.pipeline
+        if pipeline.route_call is not None:
+            response = await pipeline.route_call(pipeline.roles, payload)
+        else:
+            response = {}
+            for role in pipeline.roles:
+                response = await pipeline.call(role, payload)
+                if response.get("cache_miss") or "argmax" in response:
+                    break
+                payload = response
+        if response.get("cache_miss"):
+            return None
+        if "argmax" not in response:
+            raise RuntimeError("last stage did not return argmax — check the layer ranges of the roles")
+        return response["argmax"]
+
+    async def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        eos_token_id: Optional[int | list[int]] = None,
+        on_token: Optional[Callable[[int], None]] = None,
+    ) -> SpeculativeResult:
+        if input_ids.dim() != 2 or input_ids.shape[0] != 1:
+            raise ValueError("input_ids must have shape (1, seq_len): batching is not supported")
+        eos = {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])
+
+        session_id = uuid.uuid4().hex
+        sequence = input_ids.clone()
+        new_ids: list[int] = []
+        token_seconds: list[float] = []
+        prefill_seconds = 0.0
+        recoveries = rounds = proposed_total = accepted_total = 0
+        cached = 0  # valid tokens in the stage caches
+
+        try:
+            while len(new_ids) < max_new_tokens:
+                started = time.perf_counter()
+                k = min(self.k, max_new_tokens - len(new_ids))
+                proposal = self.draft.propose(sequence, k)
+                pending = sequence[:, cached:]
+                candidate = torch.cat([pending, torch.tensor([proposal], dtype=sequence.dtype)], dim=1)
+
+                target = await self._verify(session_id, cached, candidate)
+                attempts = 0
+                while target is None:
+                    # A stage lost its cache: replay sequence + proposal from scratch.
+                    attempts += 1
+                    recoveries += 1
+                    if attempts > self.max_recoveries_per_step:
+                        raise CacheRecoveryError(f"stages keep losing the cache (round {rounds})")
+                    full = torch.cat([sequence, torch.tensor([proposal], dtype=sequence.dtype)], dim=1)
+                    replay = await self._verify(session_id, 0, full)
+                    # The replay covers every position; candidate == full[cached:].
+                    target = None if replay is None else replay[cached:]
+                rounds += 1
+
+                # target[i] is the target model's next token after candidate[: i + 1].
+                offset = pending.shape[1] - 1
+                predictions = target[offset:].tolist()  # k + 1 values
+                accepted = 0
+                while accepted < k and proposal[accepted] == predictions[accepted]:
+                    accepted += 1
+                round_tokens = proposal[:accepted] + [predictions[accepted]]
+                proposed_total += k
+                accepted_total += accepted
+
+                stop = False
+                emitted: list[int] = []
+                for token in round_tokens:
+                    if len(new_ids) >= max_new_tokens:
+                        break
+                    new_ids.append(token)
+                    emitted.append(token)
+                    if on_token is not None:
+                        on_token(token)
+                    if token in eos:
+                        stop = True
+                        break
+
+                old_length = sequence.shape[1]
+                sequence = torch.cat([sequence, torch.tensor([emitted], dtype=sequence.dtype)], dim=1)
+                # Stages hold pending + proposal; valid are pending + accepted drafts.
+                cached = old_length + accepted
+                self.draft.accept(old_length + accepted)
+
+                elapsed = time.perf_counter() - started
+                if rounds == 1:
+                    prefill_seconds = elapsed  # includes the prompt; not counted in token_seconds
+                else:
+                    token_seconds.extend([elapsed / len(emitted)] * len(emitted))
+                if stop:
+                    break
+        finally:
+            await self.pipeline._close(session_id)
+
+        return SpeculativeResult(
+            token_ids=new_ids,
+            prefill_seconds=prefill_seconds,
+            token_seconds=token_seconds,
+            cache_recoveries=recoveries,
+            rounds=rounds,
+            proposed_draft_tokens=proposed_total,
+            accepted_draft_tokens=accepted_total,
+        )
