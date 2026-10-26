@@ -13,6 +13,7 @@ architecture transformers supports in that form (Llama, Qwen2/3, Mistral, ...).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -74,24 +75,71 @@ def _weight_files(model_id: str, needed: set[str], token: Optional[str]) -> list
     raise FileNotFoundError(f"No safetensors/bin checkpoint found for {model_id}")
 
 
-def _read_tensors(path: str, wanted: dict[str, str]) -> dict[str, torch.Tensor]:
-    """Read checkpoint tensors {stage_name: checkpoint_name} that exist in this file."""
-    out: dict[str, torch.Tensor] = {}
-    if path.endswith(".safetensors"):
-        from safetensors import safe_open
+class _CheckpointReader:
+    """Lazy access to checkpoint tensors across shards (safetensors or mmap-ed .bin)."""
 
-        with safe_open(path, framework="pt") as fh:
-            keys = set(fh.keys())
-            for name, src in wanted.items():
-                if src in keys:
-                    out[name] = fh.get_tensor(src)
-        return out
+    def __init__(self, paths: list[str]) -> None:
+        self._sources: dict[str, Any] = {}
+        self._stack = contextlib.ExitStack()
+        for path in paths:
+            if path.endswith(".safetensors"):
+                from safetensors import safe_open
 
-    state = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
-    for name, src in wanted.items():
-        if src in state:
-            out[name] = state[src]
-    return out
+                handle = self._stack.enter_context(safe_open(path, framework="pt"))
+                for key in handle.keys():
+                    self._sources[key] = handle
+            else:
+                state = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+                for key in state:
+                    self._sources[key] = state
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._sources
+
+    def get(self, key: str) -> torch.Tensor:
+        source = self._sources[key]
+        return source.get_tensor(key) if hasattr(source, "get_tensor") else source[key]
+
+    def close(self) -> None:
+        self._stack.close()
+
+
+QUANTIZATION_METHODS = ("nf4", "fp4", "int8")
+
+
+def _quantize_linears(module: torch.nn.Module, method: str, compute_dtype: torch.dtype, device: torch.device) -> None:
+    """Replace nn.Linear children (recursively) with bitsandbytes modules, quantized on ``device``."""
+    try:
+        import bitsandbytes as bnb
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "Quantized stages need bitsandbytes: pip install 'distllm[quantization]'"
+        ) from exc
+
+    for name, child in list(module.named_children()):
+        if not isinstance(child, torch.nn.Linear):
+            _quantize_linears(child, method, compute_dtype, device)
+            continue
+        weight = child.weight.data
+        with torch.device("meta"):
+            if method == "int8":
+                quantized = bnb.nn.Linear8bitLt(
+                    child.in_features, child.out_features, bias=child.bias is not None,
+                    has_fp16_weights=False, threshold=6.0,
+                )
+            else:
+                quantized = bnb.nn.Linear4bit(
+                    child.in_features, child.out_features, bias=child.bias is not None,
+                    compute_dtype=compute_dtype, quant_type=method,
+                )
+        if method == "int8":
+            quantized.weight = bnb.nn.Int8Params(weight, requires_grad=False, has_fp16_weights=False)
+        else:
+            quantized.weight = bnb.nn.Params4bit(weight, requires_grad=False, quant_type=method)
+        if child.bias is not None:
+            quantized.bias = torch.nn.Parameter(child.bias.data, requires_grad=False)
+        # Moving to the device is what quantizes the weights in bitsandbytes.
+        setattr(module, name, quantized.to(device))
 
 
 def _stage_config(config: Any, layer_start: int, layer_end: int) -> Any:
@@ -111,13 +159,18 @@ def load_stage(
     device: Optional[str] = "auto",
     dtype: Optional[str] = "auto",
     token: Optional[str] = None,
+    quantize: Optional[str] = None,
     max_sessions: int = 8,
     session_ttl: float = 600.0,
 ) -> "PipelineStage":
     """Build a stage holding layers [layer_start, layer_end] (inclusive) of ``model_id``.
 
     Only the tensors of this stage are read from disk, so a node needs memory for
-    its own slice, not for the whole model.
+    its own slice, not for the whole model. Weights are loaded layer by layer; with
+    ``quantize`` ("nf4", "fp4" or "int8", via bitsandbytes) the linear layers of every
+    transformer block are quantized as they are loaded, so peak memory is the
+    quantized stage plus one full-precision layer. Embeddings, final norm and
+    ``lm_head`` stay in ``dtype``.
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -127,6 +180,8 @@ def load_stage(
         raise ValueError(
             f"Invalid layer range [{layer_start}, {layer_end}] for a model with {n_layers} layers"
         )
+    if quantize is not None and quantize not in QUANTIZATION_METHODS:
+        raise ValueError(f"quantize must be one of {QUANTIZATION_METHODS}, got {quantize!r}")
     is_first = layer_start == 0
     is_last = layer_end == n_layers - 1
     tied = bool(getattr(config, "tie_word_embeddings", False))
@@ -151,35 +206,55 @@ def load_stage(
         elif is_last:
             wanted[name] = name  # final norm, lm_head
 
-    tensors: dict[str, torch.Tensor] = {}
-    for path in _weight_files(model_id, set(wanted.values()), token):
-        tensors.update(_read_tensors(path, wanted))
-
-    if is_last and "lm_head.weight" in wanted and "lm_head.weight" not in tensors and tied:
-        embed_key = next((k for k in tensors if "embed_tokens" in k), None)
-        if embed_key is not None:
-            tensors["lm_head.weight"] = tensors[embed_key]
-
-    missing = sorted(k for k in wanted if k not in tensors)
-    if missing:
-        raise ValueError(
-            f"Checkpoint of {model_id} has no tensors {missing[:4]}... "
-            "Only decoder-only *ForCausalLM checkpoints whose tensor names match the "
-            "model's parameter names are supported (multimodal checkpoints are not)."
-        )
-
-    tensors = {
-        k: (v.to(torch_dtype) if v.is_floating_point() else v).to(torch_device) for k, v in tensors.items()
-    }
-    model.load_state_dict(tensors, strict=False, assign=True)
-
+    reader = _CheckpointReader(_weight_files(model_id, set(wanted.values()), token))
     base = getattr(model, model.base_model_prefix)
+    try:
+        lm_head_from_embed = (
+            is_last and tied and "lm_head.weight" in wanted and wanted["lm_head.weight"] not in reader
+        )
+        missing = sorted(
+            k for k, src in wanted.items()
+            if src not in reader and not (k == "lm_head.weight" and lm_head_from_embed)
+        )
+        if missing:
+            raise ValueError(
+                f"Checkpoint of {model_id} has no tensors {missing[:4]}... "
+                "Only decoder-only *ForCausalLM checkpoints whose tensor names match the "
+                "model's parameter names are supported (multimodal checkpoints are not)."
+            )
+
+        # Group by transformer layer so that only one layer is in full precision at a time.
+        groups: dict[int, list[str]] = {}
+        for name in wanted:
+            if name == "lm_head.weight" and lm_head_from_embed:
+                continue
+            match = _LAYER_RE.search(name)
+            groups.setdefault(int(match.group(2)) if match else -1, []).append(name)
+
+        for index in sorted(groups):
+            quantize_group = quantize is not None and index >= 0
+            # Quantized layers are staged on CPU and quantized while moving to the device.
+            target = torch.device("cpu") if quantize_group else torch_device
+            tensors = {}
+            for name in groups[index]:
+                tensor = reader.get(wanted[name])
+                if tensor.is_floating_point():
+                    tensor = tensor.to(torch_dtype)
+                tensors[name] = tensor.to(target)
+            model.load_state_dict(tensors, strict=False, assign=True)
+            del tensors
+            if quantize_group:
+                layer = base.layers[index]
+                _quantize_linears(layer, quantize, torch_dtype, torch_device)
+                layer.to(torch_device)
+    finally:
+        reader.close()
+
     if is_last and model.lm_head.weight.is_meta:
-        # Tied embeddings: assign=True replaced the shared parameter only on embed_tokens.
-        embed_key = next((k for k in tensors if "embed_tokens" in k), None)
-        if embed_key is None:
+        # Tied embeddings: lm_head shares the (just loaded) embedding matrix.
+        if base.embed_tokens is None or base.embed_tokens.weight.is_meta:
             raise ValueError("lm_head weight not found in checkpoint")
-        model.lm_head.weight = torch.nn.Parameter(tensors[embed_key], requires_grad=False)
+        model.lm_head.weight = torch.nn.Parameter(base.embed_tokens.weight.data, requires_grad=False)
     # Non-persistent buffers (e.g. rotary inv_freq) are computed in __init__ and stayed on meta.
     if getattr(base, "rotary_emb", None) is not None:
         base.rotary_emb = type(base.rotary_emb)(config=stage_config, device=torch_device)
@@ -205,7 +280,7 @@ def load_stage(
         dtype=torch_dtype,
         max_sessions=max_sessions,
         session_ttl=session_ttl,
-        name=f"{model_id}[{layer_start}:{layer_end}]",
+        name=f"{model_id}[{layer_start}:{layer_end}]" + (f" {quantize}" if quantize else ""),
     )
 
 

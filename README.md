@@ -216,6 +216,34 @@ uv run python benchmarks/bench_pipeline.py --model-id HuggingFaceTB/SmolLM2-360M
     --worker-rtt-ms 60 --client-rtt-ms 20 --modes distllm,route,spec-2,spec-4,spec-6
 ```
 
+### Quantized stages
+
+`load_stage(..., quantize="nf4" | "fp4" | "int8")` (worker flag `--quantize`) quantizes the
+linear layers of every transformer block with bitsandbytes while loading — layer by layer,
+so peak memory is the quantized stage plus one full-precision layer. Embeddings, the final
+norm and `lm_head` stay in the stage dtype. Install with `uv sync --extra quantization`
+(bitsandbytes >= 0.46 also runs on CPU).
+
+This is what makes free Colab useful: a 7B model in float16 is ~14 GB, in nf4 ~4 GB of
+transformer blocks — split over two T4s it leaves plenty of room for the KV cache.
+
+- model: `Qwen/Qwen2.5-0.5B` (24 layers), 2 stages, CPU, compute dtype float32
+- 32 greedy tokens; agreement = share of positions equal to the float32 pipeline (greedy decoding diverges for good after the first different token)
+- embeddings / lm_head are not quantized; they dominate the first/last stage of small models
+
+| method | transformer blocks, MiB | largest stage, MiB | token agreement with fp32 | first differing token | per token, ms |
+|---|---:|---:|---:|---:|---:|
+| none | 1365 | 1202 | 100% | — | 62 |
+| int8 | 342 | 690 | 19% | 2 | 176 |
+| nf4 | 171 | 605 | 3% | 0 | 234 |
+| fp4 | 171 | 605 | 19% | 6 | 226 |
+
+The quantized output is identical to quantizing the same model with transformers'
+`BitsAndBytesConfig` (checked for nf4 and int8), i.e. the split itself adds no error. The
+quality loss is the quantization's: a 0.5B model is very sensitive — greedy decoding
+diverges from float32 within a few tokens. Larger models tolerate nf4 much better; measure
+on yours: `uv run --extra quantization python benchmarks/bench_quantization.py --model-id ...`.
+
 ### Security
 
 A relay exposed through a tunnel is reachable by anyone who knows its URL: without
@@ -238,7 +266,7 @@ an HTTPS tunnel (cloudflared, ngrok) between Colab and the relay.
 ### Limitations
 
 - Batch size 1 and greedy decoding.
-- float16 / bfloat16 / float32 only — 4-bit/8-bit quantized stages are not supported yet.
+- Quantization is bitsandbytes nf4/fp4/int8 only (no GPTQ/AWQ checkpoints).
 - Checkpoints must be decoder-only `*ForCausalLM` with tensor names matching the model
   (multimodal checkpoints such as Gemma 3 are rejected with a clear error).
 - Run one worker per stage role: with several replicas of one role the KV cache is
