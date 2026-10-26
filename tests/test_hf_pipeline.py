@@ -297,3 +297,44 @@ def test_stage_rewind_and_argmax_output():
 
     # Без rewind позиция меньше длины кэша — это промах.
     assert stage.handle({"session_id": "s", "start_pos": 4, "input_ids": PROMPT[:, 4:]})["cache_miss"]
+
+
+def test_failed_forward_drops_session(monkeypatch):
+    (stage,) = _make_stages(MODELS[0], n_stages=1)
+    stage.handle({"session_id": "s", "start_pos": 0, "input_ids": PROMPT})
+    layers = stage.base.layers
+    original = layers[-1].forward
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("CUDA out of memory (simulated)")
+
+    # Первый слой уже дописал KV в кэш, последний падает.
+    monkeypatch.setattr(layers[-1], "forward", boom)
+    with pytest.raises(RuntimeError, match="out of memory"):
+        stage.handle({"session_id": "s", "start_pos": PROMPT.shape[1], "input_ids": PROMPT[:, :1]})
+    monkeypatch.setattr(layers[-1], "forward", original)
+
+    # Испорченный кэш не используется: клиент получит cache_miss и сделает повтор.
+    again = stage.handle({"session_id": "s", "start_pos": PROMPT.shape[1], "input_ids": PROMPT[:, :1]})
+    assert again["cache_miss"]
+
+
+@pytest.mark.parametrize(
+    "checkpoint_dtype,bf16_supported,expected",
+    [
+        ("bfloat16", True, torch.bfloat16),
+        ("bfloat16", False, torch.float16),  # T4: no bf16
+        ("float16", True, torch.float16),
+        (None, True, torch.float16),
+    ],
+)
+def test_auto_dtype_on_cuda(monkeypatch, checkpoint_dtype, bf16_supported, expected):
+    from types import SimpleNamespace
+
+    from distllm.hf import _resolve_dtype
+
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *a, **k: bf16_supported)
+    config = SimpleNamespace(dtype=checkpoint_dtype)
+    assert _resolve_dtype("auto", torch.device("cuda"), config) == expected
+    assert _resolve_dtype("auto", torch.device("cpu"), config) == torch.float32
+    assert _resolve_dtype("float16", torch.device("cpu"), config) == torch.float16
