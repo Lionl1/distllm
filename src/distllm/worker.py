@@ -7,10 +7,13 @@ from typing import Callable, Optional
 from .transport import pack_payload, unpack_payload
 
 class Worker:
-    def __init__(self, role: str, relay_url: str, node_id: str = None):
+    def __init__(self, role: str, relay_url: str, node_id: str = None, idle_sleep: float = 0.0):
         self.role = role
         self.relay_url = relay_url.rstrip("/")
         self.node_id = node_id or str(uuid.uuid4())[:8]
+        # Pause between polls. Not needed: /poll already long-polls on the relay.
+        # Kept as a knob to reproduce the old (0.5s) behaviour in benchmarks.
+        self.idle_sleep = idle_sleep
         # High timeout for unstable tunnels
         self.client = httpx.AsyncClient(timeout=120.0)
 
@@ -93,8 +96,9 @@ class Worker:
                 except Exception as e:
                     print(f"[!] Worker loop error: {e}")
                     await asyncio.sleep(2) # Prevent rapid-fire errors
-                
-                await asyncio.sleep(0.5)
+
+                if self.idle_sleep > 0:
+                    await asyncio.sleep(self.idle_sleep)
         finally:
             heartbeat_task.cancel()
             try:
@@ -120,9 +124,9 @@ def worker_node(role: str, relay_url: str = "http://localhost:8000"):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
-        
-        def start(node_id: str = None):
-            worker = Worker(role=role, relay_url=relay_url, node_id=node_id)
+
+        def start(node_id: str = None, idle_sleep: float = 0.0):
+            worker = Worker(role=role, relay_url=relay_url, node_id=node_id, idle_sleep=idle_sleep)
             asyncio.run(worker.run(func))
         
         wrapper.start = start
@@ -130,11 +134,19 @@ def worker_node(role: str, relay_url: str = "http://localhost:8000"):
     return decorator
 
 class Cluster:
-    """Entry point for submitting tasks and awaiting results."""
-    def __init__(self, relay_url: str):
+    """Entry point for submitting tasks and awaiting results.
+
+    By default results are fetched with long-polling: the relay answers as soon
+    as the task finishes. ``poll_interval`` switches to the old short-polling
+    (check every N seconds) and exists for comparison in benchmarks.
+    """
+    LONG_POLL_WAIT = 30.0
+
+    def __init__(self, relay_url: str, poll_interval: Optional[float] = None):
         self.relay_url = relay_url.rstrip("/")
         self.client = httpx.AsyncClient(timeout=120.0)
         self.node_id = "client-" + str(uuid.uuid4())[:8]
+        self.poll_interval = poll_interval
 
     async def __aenter__(self):
         return self
@@ -158,22 +170,34 @@ class Cluster:
         return resp.json()["task_id"]
 
     async def wait_for(self, task_id: str, timeout: float = 60.0) -> dict:
-        """Polls for the result of a task."""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        """Waits for the result of a task (long-poll by default)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            long_poll = self.poll_interval is None
+            params = {"wait": min(remaining, self.LONG_POLL_WAIT)} if long_poll else None
             try:
-                resp = await self.client.get(f"{self.relay_url}/get_result/{task_id}")
+                resp = await self.client.get(f"{self.relay_url}/get_result/{task_id}", params=params)
                 if resp.status_code == 200:
                     if resp.headers.get("content-type") == "application/octet-stream":
                         return unpack_payload(resp.content)
-                    else:
-                        try:
-                            data = resp.json()
-                            if data.get("status") == "FAILED":
-                                raise RuntimeError(f"Task failed on worker: {data.get('error')}")
-                        except (ValueError, KeyError):
-                            pass
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        data = {}
+                    if data.get("status") == "FAILED":
+                        raise RuntimeError(f"Task failed on worker: {data.get('error')}")
             except httpx.HTTPError:
-                pass
-            await asyncio.sleep(1)
+                # Relay unreachable or long-poll interrupted: back off briefly and retry.
+                await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+                continue
+            if not long_poll:
+                await asyncio.sleep(self.poll_interval)
         raise TimeoutError(f"Task {task_id} timed out.")
+
+    async def call(self, role: str, payload: dict, timeout: float = 120.0) -> dict:
+        """Submits a task and waits for its result."""
+        task_id = await self.submit(role, payload)
+        return await self.wait_for(task_id, timeout=timeout)
