@@ -4,13 +4,25 @@ build-backend = "hatchling.build"
 
 [project]
 name = "distllm"
-version = "0.1.0"
-description = "A fault-tolerant distributed LLM inference framework for unstable nodes."
+version = "0.2.0"
+description = "Fault-tolerant pipeline-parallel LLM inference across unreliable nodes (e.g. free Colab GPUs) through a single relay."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Developer", email = "dev@example.com" }
+    { name = "Lionl1" }
+]
+keywords = ["llm", "inference", "distributed", "pipeline-parallelism", "speculative-decoding", "colab", "transformers"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "torch>=2.2.0",
@@ -25,6 +37,11 @@ dependencies = [
     "safetensors>=0.4.0",
     "huggingface_hub>=0.24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Lionl1/distllm"
+Documentation = "https://github.com/Lionl1/distllm/tree/main/docs"
+Changelog = "https://github.com/Lionl1/distllm/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 quantization = [
