@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rust relay (`relay-rs/`, axum + tokio): drop-in replacement with the same protocol;
+  ~2.2× lower per-hop latency, 3.6 MB RSS instead of ~240 MB. HTTP conformance suite
+  `tests/test_relay_http.py` runs against both relays.
 - Batching: `PipelineStage.handle_batch` runs decode steps of concurrent sessions in one
   forward (padded caches + attention mask); relay `/poll?max_tasks=`; `Worker(max_batch,
   batched)`; `worker_hf.py --max-batch` (default 8). Up to 2.8× throughput on MPS with 8

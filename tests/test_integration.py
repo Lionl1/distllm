@@ -28,10 +28,21 @@ def run_failing_worker():
 
 @pytest.fixture(scope="module")
 def relay_server():
+    import os
     import socket
+    import subprocess
+    from pathlib import Path
 
-    p = multiprocessing.Process(target=run_relay)
-    p.start()
+    if os.environ.get("DISTLLM_TEST_RELAY") == "rust":
+        # Same suite against the Rust relay (cargo build --release in relay-rs/).
+        binary = os.environ.get(
+            "DISTLLM_RELAY_BIN", str(Path(__file__).parents[1] / "relay-rs/target/release/distllm-relay")
+        )
+        p = subprocess.Popen([binary, "--port", "8002", "--host", "0.0.0.0"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        p = multiprocessing.Process(target=run_relay)
+        p.start()
     deadline = time.time() + 30
     while time.time() < deadline:  # wait until the relay accepts connections
         with socket.socket() as sock:

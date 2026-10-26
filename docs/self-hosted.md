@@ -18,7 +18,9 @@ you: client ──┤   stage-0 (you)  →  stage-1 (Alice)  →  stage-2 (Bob) 
 ## 1. Where to put the relay
 
 The relay must be reachable by every participant. It runs no model code, so the
-smallest VPS or any always-on machine is enough.
+smallest VPS or any always-on machine is enough — especially with the Rust relay
+(`relay-rs/`: one binary, a few MB of RAM, no Python needed on the server; same protocol and
+flags as `distllm relay`).
 
 | option | when | notes |
 |---|---|---|
