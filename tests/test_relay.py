@@ -194,3 +194,26 @@ def test_first_result_wins():
     assert client.post(f"/result/{task_id}", content=pack_payload({"y": "late"})).json() == {"status": "ignored"}
     assert client.post(f"/fail/{task_id}", params={"error_msg": "late"}).json() == {"status": "ignored"}
     assert unpack_payload(client.get(f"/get_result/{task_id}").content) == {"y": "first"}
+
+
+@pytest.mark.asyncio
+async def test_simulated_latency_per_side():
+    import httpx
+    from distllm.relay import set_simulated_latency
+
+    transport = httpx.ASGITransport(app=app)
+    set_simulated_latency(worker_rtt_ms=200, client_rtt_ms=0)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://relay") as ac:
+            t0 = time.monotonic()
+            await ac.post("/register", params={"node_id": "lat", "role": "lat"})
+            worker_elapsed = time.monotonic() - t0
+
+            t0 = time.monotonic()
+            await ac.post("/submit", content=pack_payload({}), params={"target_role": "lat", "sender_id": "c"})
+            client_elapsed = time.monotonic() - t0
+    finally:
+        set_simulated_latency(0, 0)
+
+    assert worker_elapsed >= 0.19
+    assert client_elapsed < 0.1

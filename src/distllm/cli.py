@@ -6,10 +6,16 @@ import asyncio
 app = typer.Typer(help="distllm: Distributed LLM Inference Framework")
 
 @app.command()
-def relay(port: int = 8000):
+def relay(
+    port: int = 8000,
+    simulate_worker_rtt_ms: float = typer.Option(0.0, help="Add artificial round-trip latency to worker requests (experiments only)."),
+    simulate_client_rtt_ms: float = typer.Option(0.0, help="Add artificial round-trip latency to client requests (experiments only)."),
+):
     """Starts the distllm Relay server."""
     typer.echo(f"Starting Relay on port {port}...")
-    start_relay(port=port)
+    if simulate_worker_rtt_ms or simulate_client_rtt_ms:
+        typer.echo(f"Simulating RTT: workers {simulate_worker_rtt_ms} ms, clients {simulate_client_rtt_ms} ms")
+    start_relay(port=port, worker_rtt_ms=simulate_worker_rtt_ms, client_rtt_ms=simulate_client_rtt_ms)
 
 @app.command()
 def worker(
