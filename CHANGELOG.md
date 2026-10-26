@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- `docs/self-hosted.md`: running on your own machines with friends (relay placement,
+  mixed hardware, privacy and trust).
+- `examples/plan_split.py`: memory-based layer split across machines, prints the commands.
+
 ## 0.2.0
 
 The pipeline example did not work on current transformers and every node loaded the whole
