@@ -198,3 +198,102 @@ def test_intermediate_stage_output_is_next_payload():
 
     assert out["session_id"] == "s" and out["start_pos"] == 0
     assert "logits" in second.handle(out)
+
+
+# --------------------------------------------------------------------------- #
+# Speculative decoding
+# --------------------------------------------------------------------------- #
+
+from distllm.hf import SpeculativeGenerator  # noqa: E402
+
+
+def _random_draft(model_id: str, seed: int = 123):
+    """A different random model with the same vocabulary: low acceptance, must still be exact."""
+    config = transformers.AutoConfig.from_pretrained(model_id)
+    torch.manual_seed(seed)
+    return transformers.AutoModelForCausalLM.from_config(config).eval()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", [MODELS[0], MODELS[2]])
+@pytest.mark.parametrize("draft_kind", ["same", "random"])
+async def test_speculative_matches_greedy(model_id, draft_kind):
+    expected = _reference_greedy(model_id, PROMPT, NEW_TOKENS)
+    stages = _make_stages(model_id, n_stages=2)
+    call, roles = _direct_call(stages)
+    draft = (
+        transformers.AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32)
+        if draft_kind == "same" else _random_draft(model_id)
+    )
+
+    result = await SpeculativeGenerator(call, roles, draft, k=3).generate(PROMPT, NEW_TOKENS)
+
+    assert result.token_ids == expected
+    if draft_kind == "same":
+        # Идеальный черновик: все предложения приняты, k+1 токенов за проход.
+        assert result.acceptance_rate == 1.0
+        assert result.rounds == -(-NEW_TOKENS // 4)
+    assert all(s.cached_length("any") == 0 for s in stages)
+
+
+@pytest.mark.asyncio
+async def test_speculative_with_route_and_cache_loss():
+    model_id = MODELS[0]
+    expected = _reference_greedy(model_id, PROMPT, NEW_TOKENS)
+    stages = _make_stages(model_id, n_stages=2)
+    call, roles = _direct_call(stages)
+    by_role = dict(zip(roles, stages))
+    rounds = {"n": 0}
+
+    async def route_call(route, payload):
+        rounds["n"] += 1
+        if rounds["n"] == 3:
+            stages[1].drop_sessions()  # узел второй стадии «перезапустился»
+        for role in route:
+            payload = by_role[role].handle(payload)
+            if payload.get("stop_chain"):
+                break
+        return payload
+
+    draft = _random_draft(model_id, seed=7)
+    result = await SpeculativeGenerator(call, roles, draft, k=2, route_call=route_call).generate(
+        PROMPT, NEW_TOKENS
+    )
+
+    assert result.token_ids == expected
+    assert result.cache_recoveries == 1
+
+
+@pytest.mark.asyncio
+async def test_speculative_stops_at_eos_and_limit():
+    model_id = MODELS[0]
+    expected = _reference_greedy(model_id, PROMPT, NEW_TOKENS)
+    stages = _make_stages(model_id, n_stages=2)
+    call, roles = _direct_call(stages)
+    draft = transformers.AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32)
+
+    limited = await SpeculativeGenerator(call, roles, draft, k=4).generate(PROMPT, 5)
+    assert limited.token_ids == expected[:5]
+
+    eos = expected[3]
+    stopped = await SpeculativeGenerator(call, roles, draft, k=4).generate(
+        PROMPT, NEW_TOKENS, eos_token_id=eos
+    )
+    assert stopped.token_ids == expected[: expected.index(eos) + 1]
+
+
+def test_stage_rewind_and_argmax_output():
+    (stage,) = _make_stages(MODELS[0], n_stages=1)
+    full = stage.handle({"session_id": "s", "start_pos": 0, "input_ids": PROMPT, "output": "argmax"})
+    assert full["argmax"].shape == (PROMPT.shape[1],)
+
+    # Откатываемся к позиции 4 и пересчитываем хвост — результат тот же.
+    again = stage.handle({
+        "session_id": "s", "start_pos": 4, "rewind": True, "output": "argmax",
+        "input_ids": PROMPT[:, 4:],
+    })
+    assert torch.equal(again["argmax"], full["argmax"][4:])
+    assert stage.cached_length("s") == PROMPT.shape[1]
+
+    # Без rewind позиция меньше длины кэша — это промах.
+    assert stage.handle({"session_id": "s", "start_pos": 4, "input_ids": PROMPT[:, 4:]})["cache_miss"]

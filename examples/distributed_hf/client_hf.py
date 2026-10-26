@@ -6,10 +6,13 @@ import asyncio
 from transformers import AutoTokenizer
 
 from distllm import Cluster
-from distllm.hf import PipelineGenerator
+from distllm.hf import PipelineGenerator, SpeculativeGenerator
 
 
-async def generate(prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None):
+async def generate(
+    prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None,
+    route=False, draft_model_id=None, speculative_k=4,
+):
     print("[*] Initializing Thin Client (Tokenizer only)...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
@@ -18,7 +21,17 @@ async def generate(prompt, model_id, relay_url, worker_roles, max_new_tokens=50,
     print(f"[*] Generating tokens via {len(worker_roles)} stages: {', '.join(worker_roles)}")
 
     async with Cluster(relay_url) as cluster:
-        generator = PipelineGenerator(cluster.call, worker_roles)
+        route_call = cluster.call_route if route else None
+        if draft_model_id:
+            from transformers import AutoModelForCausalLM
+
+            print(f"[*] Speculative decoding: draft {draft_model_id}, k={speculative_k}")
+            draft = AutoModelForCausalLM.from_pretrained(draft_model_id, token=token)
+            generator = SpeculativeGenerator(
+                cluster.call, worker_roles, draft, k=speculative_k, route_call=route_call
+            )
+        else:
+            generator = PipelineGenerator(cluster.call, worker_roles, route_call=route_call)
         result = await generator.generate(
             input_ids,
             max_new_tokens,
@@ -31,6 +44,8 @@ async def generate(prompt, model_id, relay_url, worker_roles, max_new_tokens=50,
         f"[i] prefill {result.prefill_seconds * 1000:.0f} ms, "
         f"{result.tokens_per_second:.2f} tokens/s, cache recoveries: {result.cache_recoveries}"
     )
+    if hasattr(result, "acceptance_rate"):
+        print(f"[i] draft acceptance {result.acceptance_rate:.0%}, {result.tokens_per_round:.2f} tokens per round")
     return prompt + tokenizer.decode(result.token_ids)
 
 
@@ -42,7 +57,14 @@ if __name__ == "__main__":
     parser.add_argument("--workers", type=str, default="stage-0,stage-1", help="stage roles in order")
     parser.add_argument("--max-tokens", type=int, default=50)
     parser.add_argument("--token", type=str, default=None)
+    parser.add_argument("--route", action="store_true", help="chain stages relay-side (one request per step)")
+    parser.add_argument("--draft-model-id", type=str, default=None,
+                        help="small model with the same tokenizer for speculative decoding")
+    parser.add_argument("--speculative-k", type=int, default=4)
     args = parser.parse_args()
 
     worker_roles = [w.strip() for w in args.workers.split(",")]
-    asyncio.run(generate(args.prompt, args.model_id, args.relay_url, worker_roles, args.max_tokens, args.token))
+    asyncio.run(generate(
+        args.prompt, args.model_id, args.relay_url, worker_roles, args.max_tokens, args.token,
+        route=args.route, draft_model_id=args.draft_model_id, speculative_k=args.speculative_k,
+    ))
