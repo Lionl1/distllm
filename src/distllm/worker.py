@@ -15,6 +15,10 @@ class RelayAuthError(PermissionError):
     """The relay rejected the token (HTTP 401)."""
 
 
+class TaskLostError(RuntimeError):
+    """The relay does not know the task (it restarted, or the result expired)."""
+
+
 class Worker:
     def __init__(
         self,
@@ -56,6 +60,32 @@ class Worker:
             except Exception as e:
                 print(f"[!] Registration failed: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
+
+    RESULT_RETRIES = 5
+
+    async def _post_result(self, task_id: str, body: bytes, params: dict) -> bool:
+        """Upload a result, retrying transient failures with exponential backoff.
+
+        The work is already done (and a stage has advanced its KV cache): losing the
+        upload would stall the client until the relay re-queues the task.
+        """
+        delay = 0.5
+        for attempt in range(1, self.RESULT_RETRIES + 1):
+            try:
+                resp = await self.client.post(f"{self.relay_url}/result/{task_id}", content=body, params=params)
+                if resp.status_code == 401:
+                    raise RelayAuthError("Relay rejected the worker token")
+                if resp.status_code < 500:
+                    # 200 ok/ignored/forwarded; 404 task gone; 409 re-assigned: nothing to retry.
+                    return resp.status_code == 200
+                print(f"[!] Relay returned {resp.status_code} for result of {task_id} (attempt {attempt})")
+            except httpx.HTTPError as e:
+                print(f"[!] Failed to upload result of {task_id} (attempt {attempt}): {e}")
+            if attempt < self.RESULT_RETRIES:
+                await asyncio.sleep(delay)
+                delay *= 2
+        print(f"[!] Giving up on result of {task_id}; the relay will re-queue the task")
+        return False
 
     async def run(self, func: Callable):
         """Main loop for the worker node."""
@@ -114,10 +144,8 @@ class Worker:
                                 params = {"worker_id": self.node_id}
                                 if isinstance(result, dict) and result.get("stop_chain"):
                                     params["stop_chain"] = "true"
-                                await self.client.post(
-                                    f"{self.relay_url}/result/{task_id}", content=result_bytes, params=params
-                                )
-                                print(f"[v] Task {task_id} completed.")
+                                if await self._post_result(task_id, result_bytes, params):
+                                    print(f"[v] Task {task_id} completed.")
                     elif resp.status_code == 204:
                         pass # No tasks
                     elif resp.status_code == 401:
@@ -228,6 +256,14 @@ class Cluster:
                 resp = await self.client.get(f"{self.relay_url}/get_result/{task_id}", params=params)
                 if resp.status_code == 401:
                     raise RelayAuthError("Relay rejected the client token (set DISTLLM_TOKEN)")
+                if resp.status_code == 404:
+                    raise TaskLostError(
+                        f"Task {task_id} is unknown to the relay (it restarted or the result expired)"
+                    )
+                if resp.status_code != 200:
+                    # Relay error: back off instead of hammering it in a tight loop.
+                    await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+                    continue
                 if resp.status_code == 200:
                     if resp.headers.get("content-type") == "application/octet-stream":
                         return unpack_payload(resp.content)

@@ -27,6 +27,8 @@ from typing import Any, Awaitable, Callable, Optional
 
 import torch
 
+from .worker import TaskLostError
+
 _LAYER_RE = re.compile(r"(^|\.)layers\.(\d+)\.")
 
 
@@ -477,6 +479,15 @@ class PipelineGenerator:
     async def _forward(self, session_id: str, start_pos: int, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
         """Run new tokens through all stages; return last-token logits or None on cache miss."""
         payload: dict = {"session_id": session_id, "start_pos": start_pos, "input_ids": input_ids}
+        try:
+            return await self._forward_once(payload)
+        except TaskLostError:
+            # The relay lost the task (e.g. it restarted): stages may or may not have
+            # advanced their caches, so recover like a cache miss — replay the prefix.
+            return None
+
+    async def _forward_once(self, payload: dict) -> Optional[torch.Tensor]:
+        session_id, start_pos = payload["session_id"], payload["start_pos"]
         if self.route_call is not None:
             response = await self.route_call(self.roles, payload)
             if response.get("cache_miss"):
@@ -665,15 +676,18 @@ class SpeculativeGenerator:
             "input_ids": tokens,
         }
         pipeline = self.pipeline
-        if pipeline.route_call is not None:
-            response = await pipeline.route_call(pipeline.roles, payload)
-        else:
-            response = {}
-            for role in pipeline.roles:
-                response = await pipeline.call(role, payload)
-                if response.get("cache_miss") or "argmax" in response:
-                    break
-                payload = response
+        try:
+            if pipeline.route_call is not None:
+                response = await pipeline.route_call(pipeline.roles, payload)
+            else:
+                response = {}
+                for role in pipeline.roles:
+                    response = await pipeline.call(role, payload)
+                    if response.get("cache_miss") or "argmax" in response:
+                        break
+                    payload = response
+        except TaskLostError:
+            return None  # recover like a cache miss: full replay
         if response.get("cache_miss"):
             return None
         if "argmax" not in response:
