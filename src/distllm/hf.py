@@ -453,6 +453,57 @@ CallFn = Callable[[str, dict], Awaitable[dict]]
 RouteCallFn = Callable[[list, dict], Awaitable[dict]]
 
 
+@dataclass(frozen=True)
+class SamplingParams:
+    """How to pick the next token from the last stage's logits (on the client).
+
+    ``temperature == 0`` (default) is greedy decoding. ``top_k`` keeps the k most likely
+    tokens, ``top_p`` the smallest set whose probability reaches p (nucleus sampling).
+    ``seed`` makes sampling reproducible.
+    """
+
+    temperature: float = 0.0
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    seed: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        if self.top_k is not None and self.top_k < 1:
+            raise ValueError("top_k must be >= 1")
+        if self.top_p is not None and not 0 < self.top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+
+    @property
+    def greedy(self) -> bool:
+        return self.temperature == 0 or self.top_k == 1
+
+    def generator(self) -> Optional[torch.Generator]:
+        if self.seed is None:
+            return None
+        return torch.Generator().manual_seed(self.seed)
+
+
+def sample_next(logits: torch.Tensor, params: SamplingParams, generator: Optional[torch.Generator] = None) -> int:
+    """Next token id from 1-D (vocab,) or (1, vocab) logits."""
+    logits = logits.reshape(-1).float()
+    if params.greedy:
+        return int(torch.argmax(logits))
+    logits = logits / params.temperature
+    if params.top_k is not None and params.top_k < logits.numel():
+        kth = torch.topk(logits, params.top_k).values[-1]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if params.top_p is not None and params.top_p < 1:
+        sorted_logits, order = torch.sort(logits, descending=True)
+        cumulative = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        # Drop tokens once the mass *before* them already reaches top_p (keeps >= 1 token).
+        drop = cumulative - torch.softmax(sorted_logits, dim=-1) >= params.top_p
+        logits = logits.masked_fill(torch.zeros_like(drop).scatter(0, order, drop), float("-inf"))
+    probs = torch.softmax(logits, dim=-1)
+    return int(torch.multinomial(probs, 1, generator=generator))
+
+
 @dataclass
 class GenerationResult:
     token_ids: list[int]
@@ -536,10 +587,14 @@ class PipelineGenerator:
         *,
         eos_token_id: Optional[int | list[int]] = None,
         on_token: Optional[Callable[[int], None]] = None,
+        sampling: Optional[SamplingParams] = None,
     ) -> GenerationResult:
+        """Generate up to ``max_new_tokens``; greedy unless ``sampling`` says otherwise."""
         if input_ids.dim() != 2 or input_ids.shape[0] != 1:
             raise ValueError("input_ids must have shape (1, seq_len): batching is not supported")
         eos = {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])
+        sampling = sampling or SamplingParams()
+        rng = sampling.generator()
 
         session_id = uuid.uuid4().hex
         sequence = input_ids.clone()
@@ -570,7 +625,7 @@ class PipelineGenerator:
                         raise RuntimeError("unexpected cache miss with start_pos=0")
 
                 cached = sequence.shape[1]
-                next_id = int(torch.argmax(logits[0]).item())
+                next_id = sample_next(logits[0], sampling, rng)
                 elapsed = time.perf_counter() - started
                 if step == 0:
                     prefill_seconds = elapsed

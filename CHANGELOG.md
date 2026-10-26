@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Sampling: `SamplingParams(temperature, top_k, top_p, seed)` for `PipelineGenerator`;
+  client flags `--temperature --top-k --top-p --seed`.
 - `docs/self-hosted.md`: running on your own machines with friends (relay placement,
   mixed hardware, privacy and trust).
 - `examples/plan_split.py`: memory-based layer split across machines, prints the commands.

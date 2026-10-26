@@ -145,6 +145,9 @@ on cache_miss or TaskLostError: replay sequence from start_pos = 0 (≤ 2 times 
 ```
 
 With `route_call=cluster.call_route` a step is one client request; otherwise one per stage.
+The next token is picked on the client from the last stage's logits: greedy by default,
+or `generate(..., sampling=SamplingParams(temperature, top_k, top_p, seed))` — seeded
+sampling is reproducible and equal to sampling from the full model with the same seed.
 Sessions are closed on all stages at the end (best effort; TTL is the safety net).
 
 ### Speculative decoding: `SpeculativeGenerator`
