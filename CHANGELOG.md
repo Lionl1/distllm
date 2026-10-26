@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Auditing: `AuditConfig(roles, rate, min_similarity)` spot-checks the pipeline against
+  trusted auditor stages and locates a stage that computes differently
+  (`VerificationError`); client flags `--audit-roles --audit-rate`.
 - Apple Silicon: `device="auto"` picks MPS after CUDA, with float16; quantization on MPS
   is rejected with a clear error.
 - Session affinity for replicas: tasks of a session go to the worker of each role that

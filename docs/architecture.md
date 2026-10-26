@@ -164,6 +164,17 @@ or `generate(..., sampling=SamplingParams(temperature, top_k, top_p, seed))` —
 sampling is reproducible and equal to sampling from the full model with the same seed.
 Sessions are closed on all stages at the end (best effort; TTL is the safety net).
 
+### Auditing: `AuditConfig`
+
+`PipelineGenerator(..., audit=AuditConfig(roles=["audit-0", "audit-1"], rate=0.05))` — the
+audit roles mirror the main roles (same layer ranges) on machines you trust. On a share
+`rate` of the generated tokens the client recomputes the current prefix through the auditor
+chain in a throwaway session (`start_pos = 0`) and compares last-position logits with the
+main pipeline's by cosine similarity (`min_similarity = 0.99`: fp16 vs fp32 hardware stays far
+above it, garbage far below). On a mismatch it swaps one main stage at a time into the
+auditor chain to find which one computes differently and raises `VerificationError(suspects,
+similarity)`. Cost: one full prefill per audit, plus one per stage when locating.
+
 ### Speculative decoding: `SpeculativeGenerator`
 
 Each round:

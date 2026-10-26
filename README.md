@@ -129,6 +129,10 @@ async with Cluster("http://relay:8000") as cluster:
     print(await cluster.call("gpu-worker", {"x": torch.ones(3)}))
 ```
 
+Spot-check friends' stages against your own copy: `PipelineGenerator(..., audit=AuditConfig(
+roles=["audit-0", "audit-1"], rate=0.05))` raises `VerificationError` naming a stage that
+computes differently.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) — relay API and task lifecycle, stage protocol,

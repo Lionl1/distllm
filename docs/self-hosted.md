@@ -96,9 +96,13 @@ So:
 - **Keep the first and the last stage on your own machine** (`me:GB:N` at both ends, as
   above). They are light on compute; give them a few layers so that what leaves your
   machine is several layers deep, not raw embeddings.
-- **Nobody verifies results.** A worker can return garbage and you get garbage text.
-  Fine among friends; not for strangers. (Spot-checking steps on a second node is on the
-  roadmap.)
+- **Results are not verified unless you ask for it.** A worker can return garbage. Run a
+  second, trusted copy of the stages (e.g. on your machine, roles `audit-0`, `audit-1`, …,
+  same layer ranges) and pass `--audit-roles audit-0,audit-1 --audit-rate 0.05`: on ~5% of
+  the tokens the client recomputes the prefix through the auditors and compares the logits;
+  a mismatch stops generation with `VerificationError` naming the stage that computes
+  differently. It catches a broken or cheating stage at the cost of occasional full
+  prefills; it does not make a pipeline of strangers trustworthy.
 - Tokens are bearer secrets: share them over a private channel, rotate them when someone
   leaves, use HTTPS or a private network.
 
