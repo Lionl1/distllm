@@ -29,7 +29,9 @@ pub struct Settings {
 
 impl Settings {
     pub fn janitor_interval(&self) -> Duration {
-        Duration::from_secs(5).min(self.task_timeout / 3).min(self.node_timeout / 3)
+        Duration::from_secs(5)
+            .min(self.task_timeout / 3)
+            .min(self.node_timeout / 3)
     }
 }
 
