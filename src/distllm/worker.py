@@ -29,6 +29,7 @@ class Worker:
         token: Optional[str] = None,
         max_batch: int = 1,
         batched: bool = False,
+        heartbeat_interval: Optional[float] = None,
     ):
         """``max_batch > 1`` takes up to that many queued tasks per poll. With
         ``batched=True`` the function receives a list of payloads and returns a list of
@@ -37,6 +38,9 @@ class Worker:
         self.role = role
         self.max_batch = max(1, max_batch)
         self.batched = batched
+        # Seconds between heartbeats ($DISTLLM_HEARTBEAT_INTERVAL); the relay declares a
+        # worker dead after its node timeout, so keep ~3 heartbeats within it.
+        self.heartbeat_interval = heartbeat_interval or float(os.environ.get("DISTLLM_HEARTBEAT_INTERVAL", "10"))
         self.relay_url = relay_url.rstrip("/")
         self.node_id = node_id or str(uuid.uuid4())[:8]
         # Pause between polls. Not needed: /poll already long-polls on the relay.
@@ -165,7 +169,7 @@ class Worker:
                         await self.register()
                 except Exception as e:
                     print(f"[!] Heartbeat error: {e}")
-                await asyncio.sleep(10) # Increased heartbeat interval
+                await asyncio.sleep(self.heartbeat_interval)
         
         heartbeat_task = asyncio.create_task(heartbeat())
 
@@ -280,11 +284,16 @@ class Cluster:
         """Closes the underlying HTTP client."""
         await self.client.aclose()
 
+    SUBMIT_RETRY_FOR = 60.0
+
     async def submit(self, role: str, payload: dict, route: Optional[list] = None) -> str:
         """Submits a task and returns the task_id.
 
         ``route`` lists roles that receive the result next: the relay forwards it
         through them and the returned task_id resolves to the last role's result.
+        Connection errors (relay restarting, tunnel hiccup) are retried with back-off for
+        up to SUBMIT_RETRY_FOR seconds; a duplicate submission is harmless because stages
+        check start_pos.
         """
         data = pack_payload(payload)
         params = {"target_role": role, "sender_id": self.node_id}
@@ -294,11 +303,21 @@ class Cluster:
         if isinstance(session, str) and session:
             # Keeps the session on the replica that holds its KV cache.
             params["session"] = session
-        resp = await self.client.post(
-            f"{self.relay_url}/submit", 
-            content=data, 
-            params=params
-        )
+        deadline = time.monotonic() + self.SUBMIT_RETRY_FOR
+        delay = 0.2
+        while True:
+            try:
+                resp = await self.client.post(f"{self.relay_url}/submit", content=data, params=params)
+                if resp.status_code < 500:
+                    break
+            except httpx.TransportError:
+                if time.monotonic() >= deadline:
+                    raise
+            else:
+                if time.monotonic() >= deadline:
+                    break  # raise_for_status below reports the 5xx
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2.0)
         if resp.status_code == 401:
             raise RelayAuthError("Relay rejected the client token (set DISTLLM_TOKEN)")
         resp.raise_for_status()

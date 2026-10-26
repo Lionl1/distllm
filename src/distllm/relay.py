@@ -126,6 +126,15 @@ SESSION_AFFINITY_TTL = 900.0
 
 TASK_TIMEOUT = 30.0 # Seconds before a task is returned to queue
 NODE_TIMEOUT = 30.0 # Seconds before a node is considered dead (3x heartbeat interval)
+JANITOR_INTERVAL = 5.0 # Seconds between janitor sweeps
+
+
+def set_timeouts(task_timeout: float = 30.0, node_timeout: float = 30.0) -> None:
+    """How fast the relay gives up on a silent task / node (lower = faster failover)."""
+    global TASK_TIMEOUT, NODE_TIMEOUT, JANITOR_INTERVAL
+    TASK_TIMEOUT = max(0.1, task_timeout)
+    NODE_TIMEOUT = max(0.1, node_timeout)
+    JANITOR_INTERVAL = min(5.0, TASK_TIMEOUT / 3, NODE_TIMEOUT / 3)
 MAX_RESULT_WAIT = 60.0 # Upper bound for long-poll in /get_result
 FINISHED = ("COMPLETED", "FAILED", "FORWARDED")
 # A worker result containing this key ends a chain early (e.g. a stage cache miss).
@@ -244,7 +253,7 @@ async def relay_janitor():
         # 3. Clean up old tasks (prevent memory leak)
         cleanup_old_tasks()
         
-        await asyncio.sleep(5)
+        await asyncio.sleep(JANITOR_INTERVAL)
 
 # --- API Endpoints ---
 
@@ -491,8 +500,16 @@ def start_relay(
     host: str = "0.0.0.0",
     token: Optional[str] = None,
     worker_token: Optional[str] = None,
+    task_timeout: float = 30.0,
+    node_timeout: float = 30.0,
 ):
-    """Run the relay. Tokens default to $DISTLLM_TOKEN / $DISTLLM_WORKER_TOKEN."""
+    """Run the relay. Tokens default to $DISTLLM_TOKEN / $DISTLLM_WORKER_TOKEN.
+
+    ``node_timeout``: a worker silent for that long (no heartbeat) is considered dead and
+    its tasks are re-queued; ``task_timeout``: an assigned task without a result for that
+    long is re-queued. Keep node_timeout above ~3 worker heartbeat intervals.
+    """
+    set_timeouts(task_timeout, node_timeout)
     token = token or os.environ.get("DISTLLM_TOKEN")
     worker_token = worker_token or os.environ.get("DISTLLM_WORKER_TOKEN")
     set_auth_tokens(token, worker_token)

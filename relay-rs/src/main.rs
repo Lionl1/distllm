@@ -46,6 +46,12 @@ struct Args {
     /// Add artificial round-trip latency to client requests (experiments only).
     #[arg(long, default_value_t = 0.0)]
     simulate_client_rtt_ms: f64,
+    /// Seconds before an assigned task without a result is re-queued.
+    #[arg(long, default_value_t = 30.0)]
+    task_timeout: f64,
+    /// Seconds without a heartbeat before a worker is considered dead.
+    #[arg(long, default_value_t = 30.0)]
+    node_timeout: f64,
 }
 
 type Shared = Arc<Relay>;
@@ -400,6 +406,8 @@ async fn main() {
         worker_token,
         worker_rtt: Duration::from_secs_f64(args.simulate_worker_rtt_ms.max(0.0) / 1000.0),
         client_rtt: Duration::from_secs_f64(args.simulate_client_rtt_ms.max(0.0) / 1000.0),
+        task_timeout: Duration::from_secs_f64(args.task_timeout.max(0.1)),
+        node_timeout: Duration::from_secs_f64(args.node_timeout.max(0.1)),
     };
     let relay = Arc::new(Relay::new(settings));
     tokio::spawn(state::janitor(relay.clone()));
