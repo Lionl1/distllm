@@ -118,10 +118,14 @@ async def test_hf_pipeline_over_relay(relay_server):
         p.start()
     try:
         async with Cluster(relay_server) as cluster:
-            generator = PipelineGenerator(cluster.call, ["hf-stage-0", "hf-stage-1"])
+            roles = ["hf-stage-0", "hf-stage-1"]
+            generator = PipelineGenerator(cluster.call, roles)
             # Workers load the model on start; the first tasks wait in the relay queue.
             result = await asyncio.wait_for(generator.generate(prompt, 6), timeout=120)
+            routed = PipelineGenerator(cluster.call, roles, route_call=cluster.call_route)
+            routed_result = await asyncio.wait_for(routed.generate(prompt, 6), timeout=60)
         assert result.token_ids == expected
+        assert routed_result.token_ids == expected
     finally:
         for p in workers:
             p.terminate()

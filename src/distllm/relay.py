@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 import uvicorn
+import msgpack
 from .transport import pack_payload, unpack_payload
 
 from contextlib import asynccontextmanager
@@ -44,12 +45,24 @@ async def simulate_network_latency(request: Request, call_next):
 
 # --- Task State Management ---
 class Task:
-    def __init__(self, task_id: str, sender_id: str, target_role: str, payload: bytes):
+    def __init__(
+        self,
+        task_id: str,
+        sender_id: str,
+        target_role: str,
+        payload: bytes,
+        route: Optional[List[str]] = None,
+        root_id: Optional[str] = None,
+    ):
         self.task_id = task_id
         self.sender_id = sender_id
         self.target_role = target_role
         self.payload = payload
-        self.status = "PENDING" # PENDING, ASSIGNED, COMPLETED, FAILED
+        # Roles that receive this task's result next (chained pipeline stages).
+        self.route = list(route or [])
+        # The task the sender waits on; the final result of the chain lands there.
+        self.root_id = root_id or task_id
+        self.status = "PENDING" # PENDING, ASSIGNED, FORWARDED, COMPLETED, FAILED
         self.worker_id = None
         self.assigned_at = None
         self.result = None
@@ -72,6 +85,9 @@ pending_queues: Dict[str, asyncio.Queue] = {} # role -> Queue
 TASK_TIMEOUT = 30.0 # Seconds before a task is returned to queue
 NODE_TIMEOUT = 30.0 # Seconds before a node is considered dead (3x heartbeat interval)
 MAX_RESULT_WAIT = 60.0 # Upper bound for long-poll in /get_result
+FINISHED = ("COMPLETED", "FAILED", "FORWARDED")
+# A worker result containing this key ends a chain early (e.g. a stage cache miss).
+STOP_CHAIN_KEY = "stop_chain"
 
 # --- Background Tasks ---
 async def cleanup_stuck_tasks():
@@ -93,10 +109,10 @@ def cleanup_old_tasks():
     to_delete = []
     for tid, task in list(tasks.items()):
         # Clean up completed or failed tasks after 5 minutes
-        if task.status in ("COMPLETED", "FAILED") and task.completed_at and (now - task.completed_at > 300.0):
+        if task.status in FINISHED and task.completed_at and (now - task.completed_at > 300.0):
             to_delete.append(tid)
         # Clean up stuck/dangling tasks older than 30 minutes
-        elif task.status not in ("COMPLETED", "FAILED") and (now - task.created_at > 1800.0):
+        elif task.status not in FINISHED and (now - task.created_at > 1800.0):
             to_delete.append(tid)
             
     for tid in to_delete:
@@ -169,18 +185,25 @@ async def heartbeat(node_id: str):
         return {"status": "ok"}
     raise HTTPException(status_code=404)
 
+async def _enqueue(task: Task) -> None:
+    tasks[task.task_id] = task
+    if task.target_role not in pending_queues:
+        pending_queues[task.target_role] = asyncio.Queue()
+    await pending_queues[task.target_role].put(task.task_id)
+
+
 @app.post("/submit")
-async def submit_task(request: Request, target_role: str, sender_id: str):
-    """Submits a task to be processed by a specific role."""
+async def submit_task(request: Request, target_role: str, sender_id: str, route: str = ""):
+    """Submits a task to be processed by a specific role.
+
+    ``route`` (comma-separated roles) chains the task: the result of each step is
+    sent by the relay straight to the next role, and the sender gets only the final
+    result — one client round trip per chain instead of one per stage.
+    """
     body = await request.body()
     task_id = str(uuid.uuid4())
-    task = Task(task_id, sender_id, target_role, body)
-    tasks[task_id] = task
-    
-    if target_role not in pending_queues:
-        pending_queues[target_role] = asyncio.Queue()
-    
-    await pending_queues[target_role].put(task_id)
+    next_roles = [r for r in (x.strip() for x in route.split(",")) if r]
+    await _enqueue(Task(task_id, sender_id, target_role, body, route=next_roles))
     return {"task_id": task_id}
 
 @app.get("/poll/{role}")
@@ -217,6 +240,26 @@ async def poll_task(role: str, worker_id: str):
     except asyncio.TimeoutError:
         return Response(status_code=204)
 
+def _stops_chain(body: bytes) -> bool:
+    try:
+        result = msgpack.unpackb(body, raw=False)
+    except Exception:  # noqa: BLE001 — not a msgpack dict: just forward it
+        return False
+    return isinstance(result, dict) and bool(result.get(STOP_CHAIN_KEY))
+
+
+def _finish(task: Task, status: str, result: bytes) -> None:
+    """Complete a task and, for the last step of a chain, its root task too."""
+    now = time.time()
+    for target in {task.task_id: task, task.root_id: tasks.get(task.root_id)}.values():
+        if target is None or target.done.is_set():
+            continue
+        target.status = status
+        target.result = result
+        target.completed_at = now
+        target.done.set()
+
+
 @app.post("/result/{task_id}")
 async def post_result(task_id: str, request: Request):
     """Workers submit the result of a task."""
@@ -226,12 +269,19 @@ async def post_result(task_id: str, request: Request):
     task = tasks[task_id]
     body = await request.body()
     # Задача могла быть переотдана другому воркеру после таймаута: первый результат побеждает.
-    if task.status in ("COMPLETED", "FAILED"):
+    if task.status in FINISHED:
         return {"status": "ignored"}
-    task.result = body
-    task.status = "COMPLETED"
-    task.completed_at = time.time()
-    task.done.set()
+
+    if task.route and not _stops_chain(body):
+        task.status = "FORWARDED"
+        task.completed_at = time.time()
+        await _enqueue(Task(
+            str(uuid.uuid4()), task.sender_id, task.route[0], body,
+            route=task.route[1:], root_id=task.root_id,
+        ))
+        return {"status": "forwarded"}
+
+    _finish(task, "COMPLETED", body)
     return {"status": "ok"}
 
 @app.post("/fail/{task_id}")
@@ -241,12 +291,9 @@ async def post_failure(task_id: str, error_msg: str):
         raise HTTPException(status_code=404)
     
     task = tasks[task_id]
-    if task.status in ("COMPLETED", "FAILED"):
+    if task.status in FINISHED:
         return {"status": "ignored"}
-    task.status = "FAILED"
-    task.result = error_msg.encode("utf-8")
-    task.completed_at = time.time()
-    task.done.set()
+    _finish(task, "FAILED", error_msg.encode("utf-8"))
     return {"status": "ok"}
 
 @app.get("/get_result/{task_id}")

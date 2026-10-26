@@ -291,7 +291,8 @@ class PipelineStage:
             if start_pos == 0:
                 sess = _Session(cache=DynamicCache(config=self.config), length=0)
             elif sess is None or sess.length != start_pos:
-                return {"cache_miss": True, "cached": sess.length if sess else 0}
+                # stop_chain: the relay must not forward this answer to the next stage.
+                return {"cache_miss": True, "cached": sess.length if sess else 0, "stop_chain": True}
 
             if self.is_first:
                 if "input_ids" not in payload:
@@ -320,7 +321,13 @@ class PipelineStage:
                 if self.is_last:
                     result = {"logits": self.model.lm_head(hidden[:, -1, :]).float().cpu()}
                 else:
-                    result = {"hidden_states": hidden.cpu()}
+                    # The output is a ready payload for the next stage, so the relay can
+                    # forward it as is (chained routes).
+                    result = {
+                        "session_id": session_id,
+                        "start_pos": start_pos,
+                        "hidden_states": hidden.cpu(),
+                    }
 
             sess.length = start_pos + new_tokens
             sess.last_used = time.time()
@@ -335,6 +342,7 @@ class PipelineStage:
 # --------------------------------------------------------------------------- #
 
 CallFn = Callable[[str, dict], Awaitable[dict]]
+RouteCallFn = Callable[[list, dict], Awaitable[dict]]
 
 
 @dataclass
@@ -359,6 +367,9 @@ class PipelineGenerator:
 
     ``call(role, payload)`` sends a payload to one stage and returns its response —
     ``Cluster.call`` over the relay, or a direct function in tests.
+    ``route_call(roles, payload)`` (optional, e.g. ``Cluster.call_route``) sends the
+    payload through all stages in one request: the relay forwards hidden states
+    from stage to stage and only the logits come back to the client.
     """
 
     def __init__(
@@ -366,12 +377,14 @@ class PipelineGenerator:
         call: CallFn,
         roles: list[str],
         *,
+        route_call: Optional[RouteCallFn] = None,
         use_kv_cache: bool = True,
         max_recoveries_per_step: int = 2,
     ) -> None:
         if not roles:
             raise ValueError("at least one stage role is required")
         self.call = call
+        self.route_call = route_call
         self.roles = list(roles)
         self.use_kv_cache = use_kv_cache
         self.max_recoveries_per_step = max_recoveries_per_step
@@ -379,6 +392,13 @@ class PipelineGenerator:
     async def _forward(self, session_id: str, start_pos: int, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
         """Run new tokens through all stages; return last-token logits or None on cache miss."""
         payload: dict = {"session_id": session_id, "start_pos": start_pos, "input_ids": input_ids}
+        if self.route_call is not None:
+            response = await self.route_call(self.roles, payload)
+            if response.get("cache_miss"):
+                return None
+            if "logits" not in response:
+                raise RuntimeError("route did not end with logits — check the layer ranges of the roles")
+            return response["logits"]
         for role in self.roles:
             response = await self.call(role, payload)
             if response.get("cache_miss"):
