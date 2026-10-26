@@ -13,6 +13,7 @@ architecture transformers supports in that form (Llama, Qwen2/3, Mistral, ...).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import json
@@ -44,10 +45,22 @@ def _resolve_device(device: Optional[str]) -> torch.device:
     return torch.device("cpu")
 
 
-def _resolve_dtype(dtype: Optional[str], device: torch.device) -> torch.dtype:
+def _checkpoint_dtype(config: Any) -> Optional[torch.dtype]:
+    value = getattr(config, "dtype", None) or getattr(config, "torch_dtype", None)
+    if isinstance(value, str):
+        value = getattr(torch, value, None)
+    return value if isinstance(value, torch.dtype) else None
+
+
+def _resolve_dtype(dtype: Optional[str], device: torch.device, config: Any = None) -> torch.dtype:
     if dtype is None or dtype == "auto":
-        # fp16 matmuls are slow or unsupported on CPU.
-        return torch.float16 if device.type == "cuda" else torch.float32
+        if device.type != "cuda":
+            return torch.float32  # fp16/bf16 matmuls are slow or unsupported on CPU
+        # Models trained in bf16 (Qwen2.5, Llama 3, ...) can overflow in fp16 and produce
+        # NaN logits; keep bf16 where the GPU supports it (Ampere+), fp16 otherwise (T4).
+        if _checkpoint_dtype(config) == torch.bfloat16 and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
     try:
         return {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[dtype]
     except KeyError as exc:
@@ -189,7 +202,7 @@ def load_stage(
     tied = bool(getattr(config, "tie_word_embeddings", False))
 
     torch_device = _resolve_device(device)
-    torch_dtype = _resolve_dtype(dtype, torch_device)
+    torch_dtype = _resolve_dtype(dtype, torch_device, config)
     stage_config = _stage_config(config, layer_start, layer_end)
 
     with torch.device("meta"):
@@ -398,13 +411,21 @@ class PipelineStage:
                 start_pos, start_pos + new_tokens, device=self.device
             ).unsqueeze(0)
 
+            try:
+                with torch.inference_mode():
+                    out = self.base(
+                        **inputs,
+                        position_ids=position_ids,
+                        past_key_values=sess.cache,
+                        use_cache=True,
+                    )
+            except Exception:
+                # Layers before the failing one (e.g. CUDA OOM) already appended to the
+                # cache: it no longer matches sess.length. Drop it; the next request for
+                # this session gets cache_miss and the client replays the prefix.
+                self._sessions.pop(session_id, None)
+                raise
             with torch.inference_mode():
-                out = self.base(
-                    **inputs,
-                    position_ids=position_ids,
-                    past_key_values=sess.cache,
-                    use_cache=True,
-                )
                 hidden = out.last_hidden_state
                 if self.is_last and payload.get("output") == "argmax":
                     result = {"argmax": self.model.lm_head(hidden[0]).argmax(dim=-1).cpu()}
@@ -718,7 +739,8 @@ class SpeculativeGenerator:
             while len(new_ids) < max_new_tokens:
                 started = time.perf_counter()
                 k = min(self.k, max_new_tokens - len(new_ids))
-                proposal = self.draft.propose(sequence, k)
+                # The draft model computes on the client: keep the event loop free.
+                proposal = await asyncio.to_thread(self.draft.propose, sequence, k)
                 pending = sequence[:, cached:]
                 candidate = torch.cat([pending, torch.tensor([proposal], dtype=sequence.dtype)], dim=1)
 
