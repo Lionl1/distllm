@@ -13,10 +13,11 @@ from distllm.hf import load_stage
 
 def create_worker(
     model_id, layer_start, layer_end, role, relay_url, token=None, device="auto", dtype="auto", relay_token=None,
-    quantize=None, max_batch=8,
+    quantize=None, max_batch=8, revision=None,
 ):
     stage = load_stage(
-        model_id, layer_start, layer_end, device=device, dtype=dtype, token=token, quantize=quantize
+        model_id, layer_start, layer_end, device=device, dtype=dtype, token=token, quantize=quantize,
+        revision=revision,
     )
     print(
         f"[v] Stage {stage.name} ready on {stage.device} ({stage.dtype}). "
@@ -45,11 +46,13 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="auto", help="auto | float16 | bfloat16 | float32")
     parser.add_argument("--quantize", type=str, default=None, choices=["nf4", "fp4", "int8"],
                         help="quantize the stage's transformer blocks with bitsandbytes")
+    parser.add_argument("--revision", type=str, default=None,
+                        help="model commit hash/branch/tag; give every stage the same commit")
     parser.add_argument("--max-batch", type=int, default=8,
                         help="decode steps of up to this many sessions run in one forward (1 = no batching)")
     args = parser.parse_args()
     create_worker(
         args.model_id, args.layer_start, args.layer_end, args.role, args.relay_url,
         token=args.token, device=args.device, dtype=args.dtype, relay_token=args.relay_token,
-        quantize=args.quantize, max_batch=args.max_batch,
+        quantize=args.quantize, max_batch=args.max_batch, revision=args.revision,
     ).start()
