@@ -40,8 +40,9 @@ def relay_server():
 
     if os.environ.get("DISTLLM_TEST_RELAY") == "rust":
         # Same suite against the Rust relay (cargo build --release in relay-rs/).
+        exe = ".exe" if os.name == "nt" else ""
         binary = os.environ.get(
-            "DISTLLM_RELAY_BIN", str(Path(__file__).parents[1] / "relay-rs/target/release/distllm-relay")
+            "DISTLLM_RELAY_BIN", str(Path(__file__).parents[1] / f"relay-rs/target/release/distllm-relay{exe}")
         )
         p = subprocess.Popen([binary, "--port", "8002", "--host", "0.0.0.0"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

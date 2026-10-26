@@ -15,7 +15,8 @@ import pytest
 from distllm.transport import pack_payload, unpack_payload
 
 ROOT = Path(__file__).parents[1]
-RUST_BIN = Path(os.environ.get("DISTLLM_RELAY_BIN", ROOT / "relay-rs/target/release/distllm-relay"))
+EXE = ".exe" if os.name == "nt" else ""
+RUST_BIN = Path(os.environ.get("DISTLLM_RELAY_BIN", ROOT / f"relay-rs/target/release/distllm-relay{EXE}"))
 IMPLS = ["python"] + (["rust"] if RUST_BIN.exists() else [])
 
 
