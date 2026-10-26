@@ -14,10 +14,10 @@ from distllm.relay import app
 async def test_wait_for_unknown_task_fails_fast():
     cluster = Cluster("http://relay")
     cluster.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app))
-    started = time.monotonic()
+    started = time.perf_counter()
     with pytest.raises(TaskLostError):
         await cluster.wait_for("no-such-task", timeout=30)
-    assert time.monotonic() - started < 2
+    assert time.perf_counter() - started < 2
     await cluster.close()
 
 
