@@ -87,27 +87,43 @@ def resolve_revision(model_id: str, revision: Optional[str] = None, token: Optio
 
 
 def _weight_files(model_id: str, needed: set[str], token: Optional[str], revision: Optional[str] = None) -> list[str]:
-    """Return local paths of only those checkpoint files that contain needed tensors."""
-    from huggingface_hub import hf_hub_download, list_repo_files
+    """Return local paths of only those checkpoint files that contain needed tensors.
+
+    Known file names are requested directly instead of listing the repository: listing
+    needs the network, a direct download is served from the local cache offline too.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
     local = os.path.isdir(model_id)
-    files = os.listdir(model_id) if local else list_repo_files(model_id, revision=revision, token=token)
 
-    def fetch(name: str) -> str:
+    def fetch(name: str) -> Optional[str]:
+        """Path of ``name`` (downloaded or cached), or None if the checkpoint has no such file."""
         if local:
-            return os.path.join(model_id, name)
-        return hf_hub_download(model_id, name, revision=revision, token=token)
+            path = os.path.join(model_id, name)
+            return path if os.path.exists(path) else None
+        try:
+            return hf_hub_download(model_id, name, revision=revision, token=token)
+        except (EntryNotFoundError, LocalEntryNotFoundError):
+            return None
 
-    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
-        if index_name in files:
-            with open(fetch(index_name), encoding="utf-8") as fh:
+    for index_name, single in (
+        ("model.safetensors.index.json", "model.safetensors"),
+        ("pytorch_model.bin.index.json", "pytorch_model.bin"),
+    ):
+        index_path = fetch(index_name)
+        if index_path is not None:
+            with open(index_path, encoding="utf-8") as fh:
                 weight_map: dict[str, str] = json.load(fh)["weight_map"]
             shards = sorted({weight_map[k] for k in needed if k in weight_map})
-            return [fetch(s) for s in shards]
-
-    for single in ("model.safetensors", "pytorch_model.bin"):
-        if single in files:
-            return [fetch(single)]
+            paths = [fetch(shard) for shard in shards]
+            missing = [shard for shard, path in zip(shards, paths) if path is None]
+            if missing:
+                raise FileNotFoundError(f"{model_id}: shards {missing} listed in {index_name} are missing")
+            return paths
+        single_path = fetch(single)
+        if single_path is not None:
+            return [single_path]
     raise FileNotFoundError(f"No safetensors/bin checkpoint found for {model_id}")
 
 
@@ -214,13 +230,18 @@ def load_stage(
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    if revision is not None and not os.path.isdir(model_id):
-        # transformers turns an unknown revision into a confusing "Unrecognized model" error.
-        try:
-            resolve_revision(model_id, revision, token)
-        except Exception as exc:
-            raise ValueError(f"Revision {revision!r} not found for {model_id}: {exc}") from exc
-    config = AutoConfig.from_pretrained(model_id, token=token, revision=revision)
+    try:
+        config = AutoConfig.from_pretrained(model_id, token=token, revision=revision)
+    except Exception:
+        # transformers reports an unknown revision as a confusing "Unrecognized model". Ask the
+        # Hub only now, after a failure: an up-front check would break offline loading of a
+        # cached, pinned model (HF_HUB_OFFLINE=1) and cost a request on every start.
+        if revision is not None and not os.path.isdir(model_id):
+            try:
+                resolve_revision(model_id, revision, token)
+            except Exception as exc:
+                raise ValueError(f"Revision {revision!r} not found for {model_id}: {exc}") from exc
+        raise
     n_layers = config.num_hidden_layers
     if not (0 <= layer_start <= layer_end < n_layers):
         raise ValueError(

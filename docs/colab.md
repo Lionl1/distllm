@@ -12,8 +12,9 @@ laptop: relay + cloudflared tunnel + client ◄──HTTPS──► Colab #1: st
 Colab notebooks can open outbound connections but accept no inbound ones; the relay is the
 only public endpoint, workers connect out to it.
 
-> Status: the code paths used here are covered by CPU tests (including nf4/int8 with
-> bitsandbytes on CPU); a full run on Colab GPUs has not been benchmarked yet.
+> Status: the code paths used here are covered by tests in CI on Linux, macOS and Windows
+> (including nf4/int8 with bitsandbytes on CPU); a full run on Colab GPUs (CUDA) has not been
+> benchmarked yet.
 
 ## 1. Relay on your machine
 
@@ -38,6 +39,13 @@ tunnels.
 
 ## 2. One notebook per stage
 
+Pin the model version first, so that both notebooks load the same weights — on your
+machine:
+
+```bash
+uv run python -c "from distllm.hf import resolve_revision; print(resolve_revision('Qwen/Qwen2.5-14B-Instruct'))"
+```
+
 Runtime → Change runtime type → **T4 GPU**. Put `DISTLLM_WORKER_TOKEN` (and `HF_TOKEN` for
 gated models) into Colab *Secrets* (the key icon), enable notebook access.
 
@@ -53,7 +61,7 @@ os.environ["DISTLLM_WORKER_TOKEN"] = userdata.get("DISTLLM_WORKER_TOKEN")
 RELAY_URL = "https://<random-words>.trycloudflare.com"
 
 MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"   # 48 layers
-REVISION = "<commit hash>"                # same in every notebook: distllm.hf.resolve_revision(MODEL_ID)
+REVISION = "<commit hash>"                # same in every notebook and in the client, see below
 ROLE, FIRST, LAST = "stage-0", 0, 23      # second notebook: "stage-1", 24, 47
 ```
 
@@ -66,9 +74,9 @@ from distllm.hf import load_stage
 stage = load_stage(MODEL_ID, FIRST, LAST, quantize="nf4", revision=REVISION)
 print(stage.name, stage.device, stage.dtype)
 
-@worker_node(role=ROLE, relay_url=RELAY_URL)
-def process(payload):
-    return stage.handle(payload)
+@worker_node(role=ROLE, relay_url=RELAY_URL, max_batch=8, batched=True)
+def process(payloads):   # decode steps of concurrent sessions share one forward
+    return stage.handle_batch(payloads)
 
 await process.run_async()   # notebooks already run an event loop: not process.start()
 ```
