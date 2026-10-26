@@ -155,10 +155,10 @@ async def test_get_result_long_poll_returns_as_soon_as_done():
             await asyncio.sleep(0.3)
             await ac.post(f"/result/{task_id}", content=pack_payload({"y": 2}))
 
-        started = time.monotonic()
+        started = time.perf_counter()
         finisher = asyncio.create_task(finish_later())
         resp = await ac.get(f"/get_result/{task_id}", params={"wait": 10})
-        elapsed = time.monotonic() - started
+        elapsed = time.perf_counter() - started
         await finisher
 
         assert resp.headers["content-type"] == "application/octet-stream"
@@ -205,17 +205,18 @@ async def test_simulated_latency_per_side():
     set_simulated_latency(worker_rtt_ms=200, client_rtt_ms=0)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://relay") as ac:
-            t0 = time.monotonic()
+            t0 = time.perf_counter()
             await ac.post("/register", params={"node_id": "lat", "role": "lat"})
-            worker_elapsed = time.monotonic() - t0
+            worker_elapsed = time.perf_counter() - t0
 
-            t0 = time.monotonic()
+            t0 = time.perf_counter()
             await ac.post("/submit", content=pack_payload({}), params={"target_role": "lat", "sender_id": "c"})
-            client_elapsed = time.monotonic() - t0
+            client_elapsed = time.perf_counter() - t0
     finally:
         set_simulated_latency(0, 0)
 
-    assert worker_elapsed >= 0.19
+    # Windows: asyncio timers may fire up to one ~15.6 ms clock tick early per sleep.
+    assert worker_elapsed >= 0.15
     assert client_elapsed < 0.1
 
 

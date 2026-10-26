@@ -109,20 +109,20 @@ def test_lifecycle(relay):
 def test_long_poll_result_and_empty_poll(relay):
     tid = submit(relay, "lp")
     threading.Timer(0.3, lambda: relay.post(f"/result/{tid}", content=pack_payload({"y": 1}))).start()
-    started = time.monotonic()
+    started = time.perf_counter()
     resp = relay.get(f"/get_result/{tid}", params={"wait": 10})
-    assert 0.25 < time.monotonic() - started < 2.5
+    assert 0.25 < time.perf_counter() - started < 2.5
     assert unpack_payload(resp.content) == {"y": 1}
-    started = time.monotonic()
+    started = time.perf_counter()
     assert relay.get("/poll/nobody", params={"worker_id": "w"}).status_code == 204
-    assert 4.5 < time.monotonic() - started < 7
+    assert 4.5 < time.perf_counter() - started < 7
 
 
 def test_poll_waits_for_a_task(relay):
     threading.Timer(0.3, lambda: submit(relay, "late")).start()
-    started = time.monotonic()
+    started = time.perf_counter()
     poll(relay, "late", "w")
-    assert time.monotonic() - started < 2.5
+    assert time.perf_counter() - started < 2.5
 
 
 def test_route_stop_chain_and_failures(relay):
@@ -225,9 +225,11 @@ def test_auth(relay_factory):
 
 def test_simulated_latency(relay_factory):
     c = relay_factory(worker_rtt_ms=200)
-    started = time.monotonic()
+    started = time.perf_counter()
     c.post("/register", params={"node_id": "n", "role": "r"})
-    assert time.monotonic() - started >= 0.19
-    started = time.monotonic()
+    # 200 ms simulated RTT = two 100 ms sleeps. On Windows asyncio timers run on a ~15.6 ms
+    # clock and may fire up to one tick early, so allow 50 ms (without latency it is ~1 ms).
+    assert time.perf_counter() - started >= 0.15
+    started = time.perf_counter()
     submit(c, "r")
-    assert time.monotonic() - started < 0.15
+    assert time.perf_counter() - started < 0.15
