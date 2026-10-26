@@ -819,8 +819,14 @@ class PipelineGenerator:
         try:
             return await self._forward_once(payload)
         except TaskLostError:
-            # The relay lost the task (e.g. it restarted): stages may or may not have
-            # advanced their caches, so recover like a cache miss — replay the prefix.
+            pass
+        # The relay lost the task (e.g. it restarted): stages may or may not have advanced
+        # their caches. Send the same step again with ``rewind``: a stage that already ran
+        # it crops back to start_pos, one that did not just runs it. Only if that fails too,
+        # recover like a cache miss (replay the prefix).
+        try:
+            return await self._forward_once({**payload, "rewind": True})
+        except TaskLostError:
             return None
 
     async def _forward_once(self, payload: dict) -> Optional[torch.Tensor]:
@@ -838,11 +844,7 @@ class PipelineGenerator:
                 return None
             if "logits" in response:
                 return response["logits"]
-            payload = {
-                "session_id": session_id,
-                "start_pos": start_pos,
-                "hidden_states": response["hidden_states"],
-            }
+            payload = response  # a ready payload for the next stage (control keys + hidden states)
         raise RuntimeError("last stage did not return logits — check the layer ranges of the roles")
 
     async def generate(

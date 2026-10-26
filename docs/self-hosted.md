@@ -185,7 +185,7 @@ only and cannot be combined with sampling or `--audit-roles`.
 | a stage never gets tasks | the role name differs from the client's `--workers` list |
 | `CUDA out of memory` | fewer layers on that machine, `--quantize nf4`, smaller `--context` / shorter prompts |
 | everything stalls ~30 s, then continues | a worker missed heartbeats; its task was re-queued |
-| `TaskLostError` | the relay restarted; the generator replays automatically |
+| `TaskLostError` | the relay restarted; the generator resends the step automatically |
 | garbage output only with one participant | that worker computes wrongly: a different `--revision` (or none), wrong model id, broken GPU, or bad intent — `--audit-roles` names it |
 
 See also: [architecture](architecture.md), [Colab guide](colab.md).

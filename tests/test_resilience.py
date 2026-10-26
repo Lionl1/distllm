@@ -85,16 +85,26 @@ async def test_generator_recovers_from_lost_task():
     stages = {f"s{i}": load_stage(model_id, i, i, device="cpu", dtype="float32") for i in range(2)}
     calls = {"n": 0}
 
+    lose = set()
+
     async def flaky(role, payload):
         calls["n"] += 1
-        if calls["n"] == 5:
-            raise TaskLostError("relay restarted")
-        return stages[role].handle(payload)
+        response = stages[role].handle(payload)  # the stage has advanced its cache...
+        if calls["n"] in lose:
+            raise TaskLostError("relay restarted")  # ...but the result never arrives
+        return response
 
     async def reliable(role, payload):
         return stages[role].handle(payload)
 
     expected = (await PipelineGenerator(reliable, list(stages)).generate(prompt, 6)).token_ids
+    # One loss: the step is resent with ``rewind`` (the stage crops back), no replay.
+    lose.update({5})
+    result = await PipelineGenerator(flaky, list(stages)).generate(prompt, 6)
+    assert result.token_ids == expected
+    assert result.cache_recoveries == 0
+    # The resent step is lost too: fall back to replaying the prefix.
+    calls["n"], lose = 0, {5, 6}
     result = await PipelineGenerator(flaky, list(stages)).generate(prompt, 6)
     assert result.token_ids == expected
     assert result.cache_recoveries == 1

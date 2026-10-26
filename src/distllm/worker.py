@@ -4,6 +4,7 @@ import uuid
 import time
 import httpx
 import functools
+from collections import OrderedDict
 from typing import Callable, Optional
 from .crypto import RID_KEY, PayloadDecryptionError, cipher_from, is_sealed
 from .transport import pack_payload, unpack_payload
@@ -62,6 +63,23 @@ class Worker:
         # High timeout for unstable tunnels
         self.client = httpx.AsyncClient(timeout=120.0, headers=_auth_headers(token))
         self.cipher = cipher_from(payload_key)
+        # Sessions this worker served recently (session_id -> last use): claimed again when
+        # it re-registers after a relay restart, so their KV caches are not replayed elsewhere.
+        self._sessions: "OrderedDict[str, float]" = OrderedDict()
+
+    def _track_sessions(self, tasks: list) -> None:
+        now = time.monotonic()
+        for _, payload in tasks:
+            session = payload.get("session_id") if isinstance(payload, dict) else None
+            if not isinstance(session, str) or not session:
+                continue
+            self._sessions.pop(session, None)
+            if not payload.get("close"):
+                self._sessions[session] = now
+        while len(self._sessions) > self.MAX_CLAIMED_SESSIONS or (
+            self._sessions and now - next(iter(self._sessions.values())) > self.SESSION_CLAIM_TTL
+        ):
+            self._sessions.popitem(last=False)
 
     def _decode(self, data: bytes):
         """A task payload, or the exception that makes it unusable (reported as the task's failure)."""
@@ -77,7 +95,7 @@ class Worker:
                 print(f"[*] Registering node {self.node_id}...")
                 resp = await self.client.post(
                     f"{self.relay_url}/register", 
-                    params={"node_id": self.node_id, "role": self.role}
+                    params={"node_id": self.node_id, "role": self.role, "sessions": ",".join(self._sessions)}
                 )
                 if resp.status_code == 200:
                     print(f"[v] Registration successful.")
@@ -93,6 +111,8 @@ class Worker:
             await asyncio.sleep(5)
 
     RESULT_RETRIES = 5
+    MAX_CLAIMED_SESSIONS = 64
+    SESSION_CLAIM_TTL = 900.0  # seconds, as the relay's session affinity
 
     async def _call(self, func: Callable, arg):
         if asyncio.iscoroutinefunction(func):
@@ -109,6 +129,7 @@ class Worker:
             tasks = [(task_id, payload) for task_id, payload in tasks if task_id not in bad]
             if not tasks:
                 return
+        self._track_sessions(tasks)
         # Encrypted requests carry an id that the result must echo (see Cluster.wait_for).
         rids = {task_id: payload.pop(RID_KEY, None) for task_id, payload in tasks if isinstance(payload, dict)}
         ids = ", ".join(task_id for task_id, _ in tasks)

@@ -12,6 +12,8 @@ pub const MAX_RESULT_WAIT: f64 = 60.0;
 pub const FINISHED_TTL: Duration = Duration::from_secs(300);
 pub const DANGLING_TTL: Duration = Duration::from_secs(1800);
 pub const SESSION_AFFINITY_TTL: Duration = Duration::from_secs(900);
+/// Sessions a worker may claim when it (re-)registers.
+pub const MAX_REPORTED_SESSIONS: usize = 256;
 pub const STOP_CHAIN_KEY: &str = "stop_chain";
 pub const STOP_CHAIN_SNIFF_LIMIT: usize = 4096;
 pub const MAX_ERROR_LENGTH: usize = 8000;
@@ -325,8 +327,23 @@ impl Relay {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn register(&self, node_id: &str, role: &str) {
+    /// `sessions`: sessions whose KV cache the worker holds. After a relay restart the
+    /// affinity map is empty; workers re-register with their sessions so that the next
+    /// steps go back to them instead of being replayed on another replica.
+    pub fn register(&self, node_id: &str, role: &str, sessions: &[&str]) {
         let mut g = self.lock();
+        let now = Instant::now();
+        for session in sessions.iter().take(MAX_REPORTED_SESSIONS) {
+            let key = (role.to_string(), session.to_string());
+            let live = g
+                .affinity
+                .get(&key)
+                .is_some_and(|(w, _)| g.nodes.contains_key(w));
+            if !live {
+                // Never steal a session from a live replica.
+                g.affinity.insert(key, (node_id.to_string(), now));
+            }
+        }
         g.nodes.insert(
             node_id.to_string(),
             Node {

@@ -177,8 +177,10 @@ result = await generator.generate(input_ids, 50, sampling=SamplingParams(tempera
   not share load within one session.
 - End-to-end encryption (`DISTLLM_PAYLOAD_KEY`) hides payloads from the relay and the
   network, not from the workers that compute on them.
-- The relay keeps its state in memory: a relay restart loses in-flight tasks (clients recover
-  by replaying the prefix, but tasks queued for workers that are still loading are lost).
+- The relay keeps its state in memory and needs none on disk: after a restart workers
+  re-register with the sessions they hold and the client resends the lost step, so a
+  generation continues without recomputation. Plain `Cluster.call` users get
+  `TaskLostError` for a task lost in the restart and resubmit it themselves.
 - CI runs the full test suite and the Rust relay on Linux, macOS and Windows (CPU; Apple MPS
   checked locally). CUDA paths (incl. bitsandbytes on CUDA) are not covered: CI has no GPU.
 
