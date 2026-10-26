@@ -316,8 +316,13 @@ def _stops_chain(body: bytes, flagged: bool) -> bool:
 
 
 def _check_worker(task: Task, worker_id: Optional[str]) -> None:
-    """Only the worker a task is assigned to may complete it (when it identifies itself)."""
-    if worker_id is not None and task.worker_id is not None and worker_id != task.worker_id:
+    """Only the worker a task is assigned to may complete it.
+
+    An assigned task requires ?worker_id= to match — omitting it would otherwise be a
+    way around the check. A task that is not assigned (never polled, or re-queued after
+    a timeout) accepts any result: first result wins.
+    """
+    if task.worker_id is not None and worker_id != task.worker_id:
         raise HTTPException(status_code=409, detail="task is assigned to another worker")
 
 
