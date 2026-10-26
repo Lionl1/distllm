@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Benchmark against llama.cpp RPC (`benchmarks/compare_llamacpp.sh`, `delay_proxy.py`): speed
+  on loopback and at 60 ms RTT, and what happens when a node dies; Petals attempt documented.
 - Offline loading: checkpoint files are requested by name instead of listing the
   repository, so a cached (pinned) model loads with `HF_HUB_OFFLINE=1`; an unknown revision
   is diagnosed only after a failed load.
