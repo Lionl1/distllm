@@ -158,13 +158,20 @@ class Cluster:
         """Closes the underlying HTTP client."""
         await self.client.aclose()
 
-    async def submit(self, role: str, payload: dict) -> str:
-        """Submits a task and returns the task_id."""
+    async def submit(self, role: str, payload: dict, route: Optional[list] = None) -> str:
+        """Submits a task and returns the task_id.
+
+        ``route`` lists roles that receive the result next: the relay forwards it
+        through them and the returned task_id resolves to the last role's result.
+        """
         data = pack_payload(payload)
+        params = {"target_role": role, "sender_id": self.node_id}
+        if route:
+            params["route"] = ",".join(route)
         resp = await self.client.post(
             f"{self.relay_url}/submit", 
             content=data, 
-            params={"target_role": role, "sender_id": self.node_id}
+            params=params
         )
         resp.raise_for_status()
         return resp.json()["task_id"]
@@ -200,4 +207,9 @@ class Cluster:
     async def call(self, role: str, payload: dict, timeout: float = 120.0) -> dict:
         """Submits a task and waits for its result."""
         task_id = await self.submit(role, payload)
+        return await self.wait_for(task_id, timeout=timeout)
+
+    async def call_route(self, roles: list, payload: dict, timeout: float = 120.0) -> dict:
+        """Sends a payload through several roles in order, relay-side, and waits for the end result."""
+        task_id = await self.submit(roles[0], payload, route=list(roles[1:]))
         return await self.wait_for(task_id, timeout=timeout)

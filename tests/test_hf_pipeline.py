@@ -163,5 +163,38 @@ def test_stage_rejects_unexpected_position():
     assert stage.handle({"session_id": "s", "start_pos": 3, "input_ids": PROMPT[:, :1]}) == {
         "cache_miss": True,
         "cached": PROMPT.shape[1],
+        "stop_chain": True,
     }
     assert stage.handle({"session_id": "other", "start_pos": 5, "input_ids": PROMPT[:, :1]})["cache_miss"]
+
+
+@pytest.mark.asyncio
+async def test_route_call_gives_same_tokens():
+    """With a route the stage outputs are forwarded as is: emulate the relay chain directly."""
+    model_id = MODELS[1]
+    expected = _reference_greedy(model_id, PROMPT, NEW_TOKENS)
+    stages = _make_stages(model_id, n_stages=2)
+    call, roles = _direct_call(stages)
+    by_role = dict(zip(roles, stages))
+    routed = []
+
+    async def route_call(route, payload):
+        routed.append(list(route))
+        for role in route:
+            payload = by_role[role].handle(payload)
+            if payload.get("stop_chain"):
+                break
+        return payload
+
+    result = await PipelineGenerator(call, roles, route_call=route_call).generate(PROMPT, NEW_TOKENS)
+
+    assert result.token_ids == expected
+    assert routed and all(r == roles for r in routed)
+
+
+def test_intermediate_stage_output_is_next_payload():
+    first, second = _make_stages(MODELS[0], n_stages=2)
+    out = first.handle({"session_id": "s", "start_pos": 0, "input_ids": PROMPT})
+
+    assert out["session_id"] == "s" and out["start_pos"] == 0
+    assert "logits" in second.handle(out)

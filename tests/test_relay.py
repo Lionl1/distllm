@@ -217,3 +217,61 @@ async def test_simulated_latency_per_side():
 
     assert worker_elapsed >= 0.19
     assert client_elapsed < 0.1
+
+
+
+def _poll(role, worker_id="w"):
+    resp = client.get(f"/poll/{role}", params={"worker_id": worker_id})
+    assert resp.status_code == 200
+    return unpack_payload(resp.content)
+
+
+def test_route_forwards_results_to_next_role():
+    submit = client.post(
+        "/submit", content=pack_payload({"x": 1}),
+        params={"target_role": "r-a", "sender_id": "c", "route": "r-b,r-c"},
+    )
+    root_id = submit.json()["task_id"]
+
+    a = _poll("r-a")
+    assert a["task_id"] == root_id
+    assert client.post(f"/result/{root_id}", content=pack_payload({"x": 2})).json() == {"status": "forwarded"}
+    # Клиенту промежуточный результат не отдаётся.
+    assert client.get(f"/get_result/{root_id}").json() == {"status": "FORWARDED"}
+
+    b = _poll("r-b")
+    assert unpack_payload(b["payload"]) == {"x": 2}
+    client.post(f"/result/{b['task_id']}", content=pack_payload({"x": 3}))
+
+    c = _poll("r-c")
+    assert unpack_payload(c["payload"]) == {"x": 3}
+    client.post(f"/result/{c['task_id']}", content=pack_payload({"final": True}))
+
+    assert unpack_payload(client.get(f"/get_result/{root_id}").content) == {"final": True}
+
+
+def test_stop_chain_returns_early():
+    root_id = client.post(
+        "/submit", content=pack_payload({}),
+        params={"target_role": "s-a", "sender_id": "c", "route": "s-b"},
+    ).json()["task_id"]
+    _poll("s-a")
+
+    client.post(f"/result/{root_id}", content=pack_payload({"cache_miss": True, "stop_chain": True}))
+
+    assert unpack_payload(client.get(f"/get_result/{root_id}").content)["cache_miss"] is True
+    assert client.get("/poll/s-b", params={"worker_id": "w"}).status_code == 204
+
+
+def test_failure_in_chain_fails_root():
+    root_id = client.post(
+        "/submit", content=pack_payload({}),
+        params={"target_role": "f-a", "sender_id": "c", "route": "f-b"},
+    ).json()["task_id"]
+    _poll("f-a")
+    client.post(f"/result/{root_id}", content=pack_payload({"h": 1}))
+    b = _poll("f-b")
+
+    client.post(f"/fail/{b['task_id']}", params={"error_msg": "boom"})
+
+    assert client.get(f"/get_result/{root_id}").json() == {"status": "FAILED", "error": "boom"}
