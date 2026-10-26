@@ -32,17 +32,12 @@ def test_revision_reaches_every_download(monkeypatch):
     import huggingface_hub
 
     seen = []
-    real_list, real_download = huggingface_hub.list_repo_files, huggingface_hub.hf_hub_download
-
-    def list_files(repo_id, **kwargs):
-        seen.append(("list", kwargs.get("revision")))
-        return real_list(repo_id, **kwargs)
+    real_download = huggingface_hub.hf_hub_download
 
     def download(repo_id, filename, **kwargs):
         seen.append((filename, kwargs.get("revision")))
         return real_download(repo_id, filename, **kwargs)
 
-    monkeypatch.setattr(huggingface_hub, "list_repo_files", list_files)
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
     sha = resolve_revision(MODEL)
     load_stage(MODEL, 0, 0, device="cpu", dtype="float32", revision=sha)
@@ -52,3 +47,20 @@ def test_revision_reaches_every_download(monkeypatch):
 def test_unknown_revision_fails():
     with pytest.raises(ValueError, match="Revision '0+' not found"):
         load_stage(MODEL, 0, 0, device="cpu", revision="0" * 40)
+
+
+def test_pinned_cached_model_loads_offline(monkeypatch):
+    """A pinned model already in the cache must load without the network."""
+    sha = resolve_revision(MODEL)
+    load_stage(MODEL, 0, 0, device="cpu", dtype="float32", revision=sha)  # fill the cache
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    import huggingface_hub.constants as hub_constants
+
+    monkeypatch.setattr(hub_constants, "HF_HUB_OFFLINE", True)
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("the Hub API must not be called offline")
+
+    monkeypatch.setattr("huggingface_hub.HfApi.model_info", no_network)
+    stage = load_stage(MODEL, 0, 0, device="cpu", dtype="float32", revision=sha)
+    assert stage.handle({"session_id": "s", "start_pos": 0, "input_ids": PROMPT})["hidden_states"].shape[1] == 4

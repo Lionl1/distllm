@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Offline loading: checkpoint files are requested by name instead of listing the
+  repository, so a cached (pinned) model loads with `HF_HUB_OFFLINE=1`; an unknown revision
+  is diagnosed only after a failed load.
 - CI on Linux, macOS and Windows for the Python tests and the Rust relay.
 - Model revision pinning: `load_stage(..., revision=)`, `resolve_revision()`, `--revision` in
   the examples; `plan_split.py` pins the current commit in every command it prints.

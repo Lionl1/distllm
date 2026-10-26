@@ -41,7 +41,14 @@ client: tokenizer ───► │              │ ─────────�
 - **Speculative decoding**: a small draft model on the client proposes *k* tokens, the
   pipeline verifies them in one round trip — up to *k + 1* tokens per network round trip,
   still exactly greedy output of the big model.
+- **Several users at once**: replicas of a stage keep each session on the node holding its
+  cache, and workers batch the decode steps of concurrent sessions into one forward.
+- **Sampling** (temperature, top-k, top-p, seed) besides greedy decoding.
+- **Spot checks** against a trusted copy of the stages name a stage that computes wrongly.
+- **One model version everywhere**: stages pin the Hub commit (`revision`), so every machine
+  loads the same weights; pinned models load offline from the cache.
 - **Bearer-token auth** for clients and workers, tensors on the wire in their own dtype.
+- **Two relays, one protocol**: Python, or a single Rust binary with a few MB of RAM.
 
 The full design: [docs/architecture.md](docs/architecture.md).
 
@@ -58,7 +65,9 @@ uv run distllm relay --port 8000
 ```
 
 On any machines that can reach the relay — your PCs, friends' computers, a VPS, or Colab
-([self-hosted guide](docs/self-hosted.md), [Colab guide](docs/colab.md)):
+([self-hosted guide](docs/self-hosted.md), [Colab guide](docs/colab.md)). With several
+machines, let `examples/plan_split.py` split the layers: it prints these commands for every
+machine with the model commit pinned (`--revision`), so all of them load the same weights.
 
 ```bash
 uv run python examples/distributed_hf/worker_hf.py --model-id Qwen/Qwen2.5-0.5B \
@@ -104,13 +113,14 @@ A stage in your own worker:
 from distllm import worker_node
 from distllm.hf import load_stage
 
-stage = load_stage("Qwen/Qwen2.5-7B", 0, 13, quantize="nf4")
+# Same commit on every machine (plan_split.py prints it; or distllm.hf.resolve_revision()).
+stage = load_stage("Qwen/Qwen2.5-7B", 0, 13, quantize="nf4", revision="<commit>")
 
-@worker_node(role="stage-0", relay_url="https://relay.example")
-def process(payload):
-    return stage.handle(payload)
+@worker_node(role="stage-0", relay_url="https://relay.example", max_batch=8, batched=True)
+def process(payloads):                   # decode steps of concurrent sessions in one forward
+    return stage.handle_batch(payloads)
 
-process.start()
+process.start()                          # in a notebook: await process.run_async()
 ```
 
 ### Low-level API
@@ -118,6 +128,7 @@ process.start()
 The relay is not tied to transformers: any function can be a worker.
 
 ```python
+import torch
 from distllm import Cluster, worker_node
 
 @worker_node(role="gpu-worker", relay_url="http://relay:8000")
@@ -131,9 +142,16 @@ async with Cluster("http://relay:8000") as cluster:
     print(await cluster.call("gpu-worker", {"x": torch.ones(3)}))
 ```
 
-Spot-check friends' stages against your own copy: `PipelineGenerator(..., audit=AuditConfig(
-roles=["audit-0", "audit-1"], rate=0.05))` raises `VerificationError` naming a stage that
-computes differently.
+Sampling and spot checks:
+
+```python
+from distllm.hf import AuditConfig, SamplingParams
+
+generator = PipelineGenerator(cluster.call, ["stage-0", "stage-1"],
+                              audit=AuditConfig(roles=["audit-0", "audit-1"], rate=0.05))
+result = await generator.generate(input_ids, 50, sampling=SamplingParams(temperature=0.7, top_p=0.9, seed=1))
+# a stage that computes differently from your trusted audit-* copy raises VerificationError
+```
 
 ## Documentation
 

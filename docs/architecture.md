@@ -2,8 +2,9 @@
 
 distllm has three kinds of processes:
 
-- **relay** — the only process that must be reachable by everyone. An HTTP server (FastAPI)
-  with in-memory task queues, one per *role*. It never runs model code.
+- **relay** — the only process that must be reachable by everyone. An HTTP server with
+  in-memory task queues per *role* (and per worker, for session affinity), in Python
+  (FastAPI) or Rust (axum). It never runs model code.
 - **workers** — connect *out* to the relay (no inbound ports, works behind NAT and in Colab),
   long-poll it for tasks of their role, run a function, post the result.
 - **clients** — submit tasks and wait for results. For LLM inference the client holds only
@@ -11,12 +12,16 @@ distllm has three kinds of processes:
 
 ```
 src/distllm/
-├── relay.py      relay server: queues, task lifecycle, routes, auth, latency simulation
-├── worker.py     Worker / worker_node (worker side), Cluster (client side)
+├── relay.py      relay server: queues, task lifecycle, routes, affinity, auth, latency simulation
+├── worker.py     Worker / worker_node (worker side, batching), Cluster (client side)
 ├── transport.py  msgpack payloads with tensors as raw bytes
-├── hf.py         Hugging Face pipeline: load_stage, PipelineStage, PipelineGenerator,
+├── hf.py         Hugging Face pipeline: load_stage, resolve_revision, PipelineStage
+│                 (handle / handle_batch), PipelineGenerator, SamplingParams, AuditConfig,
 │                 SpeculativeGenerator
 └── cli.py        `distllm relay`, `distllm worker` (echo worker for health checks)
+relay-rs/         the same relay in Rust (one binary)
+examples/         worker_hf.py, client_hf.py, plan_split.py (layer split by memory)
+benchmarks/       pipeline, quantization, batching, relay benchmarks and their results
 ```
 
 ## Relay
@@ -33,10 +38,10 @@ integration tests run against either (`DISTLLM_TEST_RELAY=rust`).
 | `POST /register?node_id&role` | worker | announce a node of a role |
 | `POST /heartbeat?node_id` | worker | every 10 s; 404 means "relay restarted, register again" |
 | `POST /deregister?node_id` | worker | graceful exit; its assigned tasks are re-queued at once |
-| `GET /poll/{role}?worker_id` | worker | long-poll (≤ 5 s) for a task: 200 with `{task_id, payload}` or 204 |
+| `GET /poll/{role}?worker_id&max_tasks` | worker | long-poll (≤ 5 s) for a task: 200 with `{task_id, payload}` (or `{tasks: [...]}` with `max_tasks > 1`), 204 if none |
 | `POST /result/{task_id}?worker_id&stop_chain` | worker | body = msgpack result |
 | `POST /fail/{task_id}?worker_id` | worker | body = error message (text, ≤ 8000 chars kept) |
-| `POST /submit?target_role&sender_id&route` | client | body = msgpack payload; returns `{task_id}` |
+| `POST /submit?target_role&sender_id&route&session` | client | body = msgpack payload; returns `{task_id}` |
 | `GET /get_result/{task_id}?wait` | client | long-poll (≤ 60 s): msgpack result, `{"status": "FAILED", "error"}`, or `{"status": ...}` while pending |
 
 ### Task lifecycle
@@ -128,8 +133,10 @@ doubled the traffic; it is still decoded). Only a whitelist of dtypes is accepte
    embeddings for the first stage, final norm and `lm_head` for the last (with tied
    embeddings `lm_head` reuses the embedding matrix).
    `revision` pins the Hub commit (all stages of a pipeline must load the same one;
-   `resolve_revision(model_id)` gives the current commit of `main`). An unknown revision
-   fails before any download.
+   `resolve_revision(model_id)` gives the current commit of `main`); an unknown revision
+   is reported as such. Files are requested by name (index, then single file; safetensors
+   before `.bin`) rather than by listing the repository, so a cached model loads offline
+   (`HF_HUB_OFFLINE=1`).
 3. Download only the shards that contain those tensors (via the safetensors/bin index) and
    read them lazily, **one transformer layer at a time**: convert to the dtype, optionally
    quantize the block's `nn.Linear` layers with bitsandbytes (nf4/fp4/int8) while moving

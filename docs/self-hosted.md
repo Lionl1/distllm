@@ -11,9 +11,9 @@ you: client ──┤   stage-0 (you)  →  stage-1 (Alice)  →  stage-2 (Bob) 
               └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> Status: the protocol, recovery, auth and quantization are covered by CPU tests with
-> separate processes over HTTP; runs on real GPUs over the internet have not been
-> benchmarked yet. Expect rough edges and please report them.
+> Status: everything here is covered by tests with separate processes over HTTP, run in CI on
+> Linux, macOS and Windows (CPU) and locally on Apple GPUs. CUDA and real internet links
+> have not been benchmarked yet. Expect rough edges and please report them.
 
 ## 1. Where to put the relay
 
@@ -113,8 +113,8 @@ So:
   above). They are light on compute; give them a few layers so that what leaves your
   machine is several layers deep, not raw embeddings.
 - **Results are not verified unless you ask for it.** A worker can return garbage. Run a
-  second, trusted copy of the stages (e.g. on your machine, roles `audit-0`, `audit-1`, …,
-  same layer ranges) and pass `--audit-roles audit-0,audit-1 --audit-rate 0.05`: on ~5% of
+  second, trusted copy of the stages (e.g. on your machine: `worker_hf.py` with roles
+  `audit-0`, `audit-1`, …, the same layer ranges and revision) and pass `--audit-roles audit-0,audit-1 --audit-rate 0.05`: on ~5% of
   the tokens the client recomputes the prefix through the auditors and compares the logits;
   a mismatch stops generation with `VerificationError` naming the stage that computes
   differently. It catches a broken or cheating stage at the cost of occasional full
@@ -137,7 +137,7 @@ then the command `plan_split.py` printed for them, e.g.:
 ```bash
 uv run python examples/distributed_hf/worker_hf.py --model-id Qwen/Qwen2.5-14B-Instruct \
     --layer-start 2 --layer-end 23 --role stage-1 --relay-url https://relay.example.com \
-    --quantize nf4
+    --dtype float16 --quantize nf4 --revision <commit printed by plan_split>
 ```
 
 Each machine downloads only the shards with its layers. You run your stages (two
@@ -147,12 +147,13 @@ terminals for `stage-0` and `stage-3` in the example) and the client:
 export DISTLLM_TOKEN=...
 uv run python examples/distributed_hf/client_hf.py --model-id Qwen/Qwen2.5-14B-Instruct \
     --workers stage-0,stage-1,stage-2,stage-3 --relay-url https://relay.example.com --route \
-    --prompt "..." --max-tokens 200
+    --revision <commit> --prompt "..." --max-tokens 200
 ```
 
 Add `--draft-model-id Qwen/Qwen2.5-0.5B-Instruct --speculative-k 4` to verify several
 tokens per network round trip (the draft runs on your machine and must share the
-tokenizer).
+tokenizer), or `--temperature 0.7 --top-p 0.9` to sample. Speculative decoding is greedy
+only and cannot be combined with sampling or `--audit-roles`.
 
 ## 6. Day-to-day
 

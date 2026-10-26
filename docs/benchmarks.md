@@ -1,16 +1,19 @@
 # Benchmarks
 
-All numbers were measured on one machine (Apple Silicon laptop, 8 GB RAM, CPU only):
+All numbers were measured on one machine (Apple Silicon laptop, 8 GB RAM; CPU unless a
+section says MPS):
 the relay and every stage run as **separate processes** talking HTTP over loopback, the
 client drives generation through them, and every run is checked to produce **exactly the
 same tokens** as the full model in one process (except quantized runs, which are compared
 with float32). Network latency, where shown, is simulated by the relay
-(`--worker-rtt-ms/--client-rtt-ms`). GPU numbers are not available yet.
+(`--worker-rtt-ms/--client-rtt-ms`). CUDA numbers are not available yet.
 
 Scripts: [`benchmarks/bench_pipeline.py`](../benchmarks/bench_pipeline.py) (pipeline modes,
 latency simulation, speculative decoding) and
 [`benchmarks/bench_quantization.py`](../benchmarks/bench_quantization.py) (memory and quality
-of quantized stages). Raw outputs are in `benchmarks/results*.md`.
+of quantized stages), [`benchmarks/bench_batching.py`](../benchmarks/bench_batching.py)
+(batched decode) and [`benchmarks/bench_relay.py`](../benchmarks/bench_relay.py) (Python vs
+Rust relay). Raw outputs are in `benchmarks/results*.md`.
 
 What the modes mean:
 
