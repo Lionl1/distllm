@@ -216,6 +216,25 @@ uv run python benchmarks/bench_pipeline.py --model-id HuggingFaceTB/SmolLM2-360M
     --worker-rtt-ms 60 --client-rtt-ms 20 --modes distllm,route,spec-2,spec-4,spec-6
 ```
 
+### Security
+
+A relay exposed through a tunnel is reachable by anyone who knows its URL: without
+a token they can submit tasks to your GPUs or register as a stage and read hidden
+states. Protect it with bearer tokens — one for clients, optionally another for
+workers, so a worker notebook cannot submit tasks and a client cannot pose as a stage:
+
+```bash
+export DISTLLM_TOKEN=$(openssl rand -hex 24)          # clients
+export DISTLLM_WORKER_TOKEN=$(openssl rand -hex 24)   # workers (defaults to DISTLLM_TOKEN)
+uv run distllm relay --port 8000                       # reads both from the environment
+```
+
+`Cluster`, `Worker`, `worker_node` and the examples pick the tokens up from the same
+variables (or `token=` / `--relay-token`). A rejected token raises `RelayAuthError`
+immediately instead of retrying forever. The relay prints a warning when it listens on
+a public interface without a token. Tokens travel in an `Authorization` header — use
+an HTTPS tunnel (cloudflared, ngrok) between Colab and the relay.
+
 ### Limitations
 
 - Batch size 1 and greedy decoding.

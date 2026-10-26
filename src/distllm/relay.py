@@ -1,8 +1,11 @@
 import time
 import asyncio
+import os
+import secrets
 import uuid
 from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 import msgpack
@@ -32,9 +35,13 @@ def set_simulated_latency(worker_rtt_ms: float = 0.0, client_rtt_ms: float = 0.0
     simulated_rtt["client"] = max(0.0, client_rtt_ms) / 1000.0
 
 
+def _side(path: str) -> str:
+    return "worker" if path.startswith(WORKER_PATHS) else "client"
+
+
 @app.middleware("http")
 async def simulate_network_latency(request: Request, call_next):
-    side = "worker" if request.url.path.startswith(WORKER_PATHS) else "client"
+    side = _side(request.url.path)
     rtt = simulated_rtt[side]
     if rtt <= 0:
         return await call_next(request)
@@ -42,6 +49,30 @@ async def simulate_network_latency(request: Request, call_next):
     response = await call_next(request)
     await asyncio.sleep(rtt / 2)
     return response
+
+
+# --- Authentication ---
+# Shared-secret bearer tokens. Workers and clients may get different tokens: a Colab
+# notebook running a worker then cannot submit tasks, and a client cannot pose as a
+# stage and read other users' hidden states. No token configured = open relay.
+auth_tokens: Dict[str, Optional[str]] = {"client": None, "worker": None}
+
+
+def set_auth_tokens(token: Optional[str] = None, worker_token: Optional[str] = None) -> None:
+    """``token`` protects client endpoints; ``worker_token`` (default: ``token``) worker ones."""
+    auth_tokens["client"] = token or None
+    auth_tokens["worker"] = worker_token or token or None
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    expected = auth_tokens[_side(request.url.path)]
+    if expected is None:
+        return await call_next(request)
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(value.strip().encode(), expected.encode()):
+        return JSONResponse({"detail": "Invalid or missing token"}, status_code=401)
+    return await call_next(request)
 
 # --- Task State Management ---
 class Task:
@@ -321,6 +352,22 @@ async def get_result(task_id: str, wait: float = 0.0):
         return {"status": "FAILED", "error": error_msg}
     return {"status": task.status}
 
-def start_relay(port: int = 8000, worker_rtt_ms: float = 0.0, client_rtt_ms: float = 0.0, host: str = "0.0.0.0"):
+def start_relay(
+    port: int = 8000,
+    worker_rtt_ms: float = 0.0,
+    client_rtt_ms: float = 0.0,
+    host: str = "0.0.0.0",
+    token: Optional[str] = None,
+    worker_token: Optional[str] = None,
+):
+    """Run the relay. Tokens default to $DISTLLM_TOKEN / $DISTLLM_WORKER_TOKEN."""
+    token = token or os.environ.get("DISTLLM_TOKEN")
+    worker_token = worker_token or os.environ.get("DISTLLM_WORKER_TOKEN")
+    set_auth_tokens(token, worker_token)
+    if not (token or worker_token) and host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            "[!] WARNING: relay is reachable from the network without a token: anyone who "
+            "knows the URL can submit tasks or register as a worker. Set DISTLLM_TOKEN."
+        )
     set_simulated_latency(worker_rtt_ms, client_rtt_ms)
     uvicorn.run(app, host=host, port=port)

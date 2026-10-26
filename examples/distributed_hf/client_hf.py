@@ -11,7 +11,7 @@ from distllm.hf import PipelineGenerator, SpeculativeGenerator
 
 async def generate(
     prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None,
-    route=False, draft_model_id=None, speculative_k=4,
+    route=False, draft_model_id=None, speculative_k=4, relay_token=None,
 ):
     print("[*] Initializing Thin Client (Tokenizer only)...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
@@ -20,7 +20,7 @@ async def generate(
     print(f"[*] Prompt: {prompt}")
     print(f"[*] Generating tokens via {len(worker_roles)} stages: {', '.join(worker_roles)}")
 
-    async with Cluster(relay_url) as cluster:
+    async with Cluster(relay_url, token=relay_token) as cluster:
         route_call = cluster.call_route if route else None
         if draft_model_id:
             from transformers import AutoModelForCausalLM
@@ -56,7 +56,8 @@ if __name__ == "__main__":
     parser.add_argument("--relay-url", type=str, default="http://localhost:8000")
     parser.add_argument("--workers", type=str, default="stage-0,stage-1", help="stage roles in order")
     parser.add_argument("--max-tokens", type=int, default=50)
-    parser.add_argument("--token", type=str, default=None)
+    parser.add_argument("--token", type=str, default=None, help="Hugging Face token")
+    parser.add_argument("--relay-token", type=str, default=None, help="relay client token (default: $DISTLLM_TOKEN)")
     parser.add_argument("--route", action="store_true", help="chain stages relay-side (one request per step)")
     parser.add_argument("--draft-model-id", type=str, default=None,
                         help="small model with the same tokenizer for speculative decoding")
@@ -67,4 +68,5 @@ if __name__ == "__main__":
     asyncio.run(generate(
         args.prompt, args.model_id, args.relay_url, worker_roles, args.max_tokens, args.token,
         route=args.route, draft_model_id=args.draft_model_id, speculative_k=args.speculative_k,
+        relay_token=args.relay_token,
     ))

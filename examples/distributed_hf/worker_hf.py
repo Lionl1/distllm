@@ -11,14 +11,16 @@ from distllm import worker_node
 from distllm.hf import load_stage
 
 
-def create_worker(model_id, layer_start, layer_end, role, relay_url, token=None, device="auto", dtype="auto"):
+def create_worker(
+    model_id, layer_start, layer_end, role, relay_url, token=None, device="auto", dtype="auto", relay_token=None,
+):
     stage = load_stage(model_id, layer_start, layer_end, device=device, dtype=dtype, token=token)
     print(
         f"[v] Stage {stage.name} ready on {stage.device} ({stage.dtype}). "
         f"First: {stage.is_first}, Last: {stage.is_last}"
     )
 
-    @worker_node(role=role, relay_url=relay_url)
+    @worker_node(role=role, relay_url=relay_url, token=relay_token)
     def process(payload):
         return stage.handle(payload)
 
@@ -32,11 +34,13 @@ if __name__ == "__main__":
     parser.add_argument("--layer-end", type=int, required=True)
     parser.add_argument("--role", type=str, required=True)
     parser.add_argument("--relay-url", type=str, default="http://localhost:8000")
-    parser.add_argument("--token", type=str, default=None)
+    parser.add_argument("--token", type=str, default=None, help="Hugging Face token")
+    parser.add_argument("--relay-token", type=str, default=None,
+                        help="relay worker token (default: $DISTLLM_WORKER_TOKEN or $DISTLLM_TOKEN)")
     parser.add_argument("--device", type=str, default="auto", help="auto | cuda | cpu | mps")
     parser.add_argument("--dtype", type=str, default="auto", help="auto | float16 | bfloat16 | float32")
     args = parser.parse_args()
     create_worker(
         args.model_id, args.layer_start, args.layer_end, args.role, args.relay_url,
-        token=args.token, device=args.device, dtype=args.dtype,
+        token=args.token, device=args.device, dtype=args.dtype, relay_token=args.relay_token,
     ).start()
