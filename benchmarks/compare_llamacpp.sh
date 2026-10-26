@@ -15,12 +15,12 @@ PIDS=()
 cleanup() { kill "${PIDS[@]}" 2>/dev/null; wait 2>/dev/null; }
 trap cleanup EXIT
 
-rpc_server() { "$B/ggml-rpc-server" -H 127.0.0.1 -p "$1" >/dev/null 2>&1 & PIDS+=($!); }
+rpc_server() { "$B/ggml-rpc-server" -H 127.0.0.1 -p "$1" >/dev/null 2>&1 & LAST=$!; PIDS+=($LAST); }
 
 echo "## single process"
 "$B/llama-bench" -m "$M" -p 37 -n 48 -r 3 2>/dev/null | grep '^|'
 
-rpc_server 50052; P1=${PIDS[-1]}
+rpc_server 50052; P1=$LAST
 rpc_server 50053
 sleep 2
 echo "## 2 RPC servers, loopback"
