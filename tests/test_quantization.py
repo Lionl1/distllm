@@ -8,7 +8,25 @@ bnb = pytest.importorskip("bitsandbytes")
 
 from distllm.hf import PipelineGenerator, load_stage  # noqa: E402
 
-LLAMA = "hf-internal-testing/tiny-random-LlamaForCausalLM"
+
+
+@pytest.fixture(scope="module")
+def LLAMA(tmp_path_factory):
+    """A tiny random Llama saved locally, with layer sizes that are multiples of 64.
+
+    hf-internal-testing/tiny-random-LlamaForCausalLM has hidden_size=16; bitsandbytes'
+    4-bit CPU kernel on some x86 CPUs requires out_features divisible by its block size
+    and fails on it (real models always satisfy this).
+    """
+    config = transformers.LlamaConfig(
+        vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128,
+    )
+    torch.manual_seed(0)
+    path = tmp_path_factory.mktemp("tiny-llama-64")
+    transformers.LlamaForCausalLM(config).save_pretrained(path)
+    return str(path)
+
 QWEN3_TIED = "yujiepan/qwen3-tiny-random"
 PROMPT = torch.tensor([[1, 5, 9, 13, 21, 34, 55]])
 
@@ -40,9 +58,10 @@ def _linear_weight_bytes(stage):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_id", [LLAMA, QWEN3_TIED])
+@pytest.mark.parametrize("model_name", ["llama", "qwen3"])
 @pytest.mark.parametrize("method", ["nf4", "int8"])
-async def test_split_quantized_equals_single_stage_quantized(model_id, method):
+async def test_split_quantized_equals_single_stage_quantized(model_name, method, LLAMA):
+    model_id = LLAMA if model_name == "llama" else QWEN3_TIED
     # Квантование слоя не зависит от того, где проходит граница стадий.
     single = await _generate(_stages(model_id, method, 1))
     split = await _generate(_stages(model_id, method, 2))
@@ -50,7 +69,7 @@ async def test_split_quantized_equals_single_stage_quantized(model_id, method):
 
 
 @pytest.mark.parametrize("method,max_ratio", [("nf4", 0.3), ("fp4", 0.3), ("int8", 0.3)])
-def test_quantized_layers_are_smaller(method, max_ratio):
+def test_quantized_layers_are_smaller(method, max_ratio, LLAMA):
     (full,) = _stages(LLAMA, None, 1)
     (quantized,) = _stages(LLAMA, method, 1)
     assert _linear_weight_bytes(quantized) < max_ratio * _linear_weight_bytes(full)
@@ -66,7 +85,7 @@ def test_only_block_linears_are_quantized():
     assert not any(p.is_meta for p in stage.model.parameters())
 
 
-def test_quantized_logits_stay_close_for_int8():
+def test_quantized_logits_stay_close_for_int8(LLAMA):
     (full,) = _stages(LLAMA, None, 1)
     (quantized,) = _stages(LLAMA, "int8", 1)
     a = full.handle({"session_id": "a", "start_pos": 0, "input_ids": PROMPT})["logits"]
@@ -74,6 +93,6 @@ def test_quantized_logits_stay_close_for_int8():
     assert ((a - b).norm() / a.norm()).item() < 0.05
 
 
-def test_unknown_method_rejected():
+def test_unknown_method_rejected(LLAMA):
     with pytest.raises(ValueError, match="quantize must be one of"):
         load_stage(LLAMA, 0, 0, device="cpu", quantize="int3")

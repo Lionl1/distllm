@@ -43,7 +43,7 @@ def test_task_lifecycle():
     # 4. Post result
     result_payload = {"y": torch.tensor([2, 4, 6])}
     packed_result = pack_payload(result_payload)
-    res_resp = client.post(f"/result/{task_id}", content=packed_result)
+    res_resp = client.post(f"/result/{task_id}", content=packed_result, params={"worker_id": "worker-1"})
     assert res_resp.status_code == 200
     
     # 5. Get result
@@ -100,7 +100,7 @@ def test_task_failure():
     client.get("/poll/buggy", params={"worker_id": "worker-err"})
     
     # 4. Report failure
-    fail_resp = client.post(f"/fail/{task_id}", params={"error_msg": "something went wrong"})
+    fail_resp = client.post(f"/fail/{task_id}", params={"error_msg": "something went wrong", "worker_id": "worker-err"})
     assert fail_resp.status_code == 200
     
     # 5. Check result status and error message
@@ -220,6 +220,9 @@ async def test_simulated_latency_per_side():
 
 
 
+W = {"worker_id": "w"}  # the worker id _poll() uses
+
+
 def _poll(role, worker_id="w"):
     resp = client.get(f"/poll/{role}", params={"worker_id": worker_id})
     assert resp.status_code == 200
@@ -235,17 +238,17 @@ def test_route_forwards_results_to_next_role():
 
     a = _poll("r-a")
     assert a["task_id"] == root_id
-    assert client.post(f"/result/{root_id}", content=pack_payload({"x": 2})).json() == {"status": "forwarded"}
+    assert client.post(f"/result/{root_id}", content=pack_payload({"x": 2}), params=W).json() == {"status": "forwarded"}
     # Клиенту промежуточный результат не отдаётся.
     assert client.get(f"/get_result/{root_id}").json() == {"status": "FORWARDED"}
 
     b = _poll("r-b")
     assert unpack_payload(b["payload"]) == {"x": 2}
-    client.post(f"/result/{b['task_id']}", content=pack_payload({"x": 3}))
+    client.post(f"/result/{b['task_id']}", content=pack_payload({"x": 3}), params=W)
 
     c = _poll("r-c")
     assert unpack_payload(c["payload"]) == {"x": 3}
-    client.post(f"/result/{c['task_id']}", content=pack_payload({"final": True}))
+    client.post(f"/result/{c['task_id']}", content=pack_payload({"final": True}), params=W)
 
     assert unpack_payload(client.get(f"/get_result/{root_id}").content) == {"final": True}
 
@@ -257,7 +260,7 @@ def test_stop_chain_returns_early():
     ).json()["task_id"]
     _poll("s-a")
 
-    client.post(f"/result/{root_id}", content=pack_payload({"cache_miss": True, "stop_chain": True}))
+    client.post(f"/result/{root_id}", content=pack_payload({"cache_miss": True, "stop_chain": True}), params=W)
 
     assert unpack_payload(client.get(f"/get_result/{root_id}").content)["cache_miss"] is True
     assert client.get("/poll/s-b", params={"worker_id": "w"}).status_code == 204
@@ -269,10 +272,10 @@ def test_failure_in_chain_fails_root():
         params={"target_role": "f-a", "sender_id": "c", "route": "f-b"},
     ).json()["task_id"]
     _poll("f-a")
-    client.post(f"/result/{root_id}", content=pack_payload({"h": 1}))
+    client.post(f"/result/{root_id}", content=pack_payload({"h": 1}), params=W)
     b = _poll("f-b")
 
-    client.post(f"/fail/{b['task_id']}", params={"error_msg": "boom"})
+    client.post(f"/fail/{b['task_id']}", params={"error_msg": "boom", **W})
 
     assert client.get(f"/get_result/{root_id}").json() == {"status": "FAILED", "error": "boom"}
 
@@ -287,14 +290,14 @@ def test_chain_root_survives_cleanup_while_chain_runs():
         params={"target_role": "slow-a", "sender_id": "c", "route": "slow-b"},
     ).json()["task_id"]
     _poll("slow-a")
-    client.post(f"/result/{root_id}", content=pack_payload({"h": 1}))
+    client.post(f"/result/{root_id}", content=pack_payload({"h": 1}), params=W)
     # Следующая стадия долго грузит модель: прошло больше 5 минут.
     tasks[root_id].completed_at = (tasks[root_id].completed_at or time.time()) - 600
     cleanup_old_tasks()
     assert root_id in tasks
 
     b = _poll("slow-b")
-    client.post(f"/result/{b['task_id']}", content=pack_payload({"final": 1}))
+    client.post(f"/result/{b['task_id']}", content=pack_payload({"final": 1}), params=W)
     assert unpack_payload(client.get(f"/get_result/{root_id}").content) == {"final": 1}
 
 
@@ -329,7 +332,7 @@ def test_stop_chain_flag_and_large_bodies_not_decoded(monkeypatch):
     calls = []
     monkeypatch.setattr(relay.msgpack, "unpackb", lambda *a, **k: calls.append(1) or {})
     big = b"\x00" * (relay.STOP_CHAIN_SNIFF_LIMIT + 1)
-    client.post(f"/result/{root_id}", content=big, params={"stop_chain": "true"})
+    client.post(f"/result/{root_id}", content=big, params={"stop_chain": "true", **W})
     assert calls == []  # флаг в запросе — тело не разбирается
     assert client.get(f"/get_result/{root_id}").content == big
 
@@ -345,3 +348,16 @@ def test_result_from_other_worker_rejected():
     ok = client.post(f"/result/{task_id}", content=pack_payload({"y": "real"}), params={"worker_id": "owner"})
     assert ok.json() == {"status": "ok"}
     assert unpack_payload(client.get(f"/get_result/{task_id}").content) == {"y": "real"}
+
+
+
+def test_assigned_task_requires_worker_id():
+    task_id = client.post(
+        "/submit", content=pack_payload({}), params={"target_role": "anon", "sender_id": "c"},
+    ).json()["task_id"]
+    _poll("anon", worker_id="owner")
+
+    # Без worker_id проверку не обойти.
+    assert client.post(f"/result/{task_id}", content=pack_payload({"y": "forged"})).status_code == 409
+    assert client.post(f"/fail/{task_id}", content=b"forged").status_code == 409
+    assert client.post(f"/result/{task_id}", content=pack_payload({"y": 1}), params={"worker_id": "owner"}).status_code == 200
