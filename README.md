@@ -142,6 +142,80 @@ On a real network every hop adds round-trip latency; the speed-up comes from rem
 
 Reproduce: `uv run python benchmarks/bench_pipeline.py --model-id Qwen/Qwen2.5-0.5B`.
 
+### Beating network latency
+
+On loopback a hop costs ~1 ms. Over a real network (free Colab GPUs behind a tunnel)
+every request to the relay costs a round trip, and that, not GPU time, bounds the
+speed: a token through 2 stages with 60 ms RTT is ~250 ms of pure networking.
+Two techniques attack it:
+
+- **Relay-side routes** (`PipelineGenerator(..., route_call=cluster.call_route)`): the
+  relay forwards hidden states from stage to stage itself; the client sends one
+  request per token instead of one per stage. Saves the client legs of every hop —
+  the farther the client is from the relay, the bigger the win.
+- **Speculative decoding** (`SpeculativeGenerator(call, roles, draft_model, k=4)`): a small
+  draft model with the same tokenizer runs on the client and proposes `k` tokens; the
+  pipeline verifies all of them in one pass (`output="argmax"`) and rejected positions
+  are cropped from the stage caches (`rewind`). One round trip yields up to `k+1`
+  tokens, and the output is exactly greedy decoding of the big model.
+
+Simulate a network locally: `distllm relay --simulate-worker-rtt-ms 60 --simulate-client-rtt-ms 20`
+(or `--worker-rtt-ms/--client-rtt-ms` in the benchmark).
+
+**With simulated network latency:**
+
+- model: `HuggingFaceTB/SmolLM2-360M` (32 layers), float32 on cpu; draft: `HuggingFaceTB/SmolLM2-135M`
+- stages: 2 (0-15, 16-31), relay and workers are separate processes on one machine (arm, Darwin)
+- network: simulated RTT to relay: workers 60 ms, client 20 ms
+- prompt: 37 tokens, generated: 48 tokens, greedy
+
+| mode | prefill, ms | per token, ms (median) | tokens/s | same tokens as full model | notes |
+|---|---:|---:|---:|:---:|---|
+| single process (no network) | 481 | 51 | 18.65 | yes |  |
+| long-poll + KV cache, request per stage | 591 | 259 | 3.80 | yes |  |
+| + relay-side route, request per token | 537 | 229 | 4.35 | yes |  |
+| + speculative decoding, k=2 | 698 | 136 | 6.06 | yes | acceptance 74%, 2.4 tokens/round |
+| + speculative decoding, k=4 | 663 | 90 | 7.85 | yes | acceptance 58%, 3.2 tokens/round |
+| + speculative decoding, k=6 | 691 | 70 | 8.46 | yes | acceptance 45%, 3.7 tokens/round |
+
+Hidden-state transfer for the 37-token prompt (bf16, hidden size 960): legacy format 139 KiB, new format 69 KiB (2.0x smaller).
+
+Over the network the pipeline is ~5x slower than one process — pure round trips.
+Routes win ~14% here (the client is close to the relay); speculative decoding wins
+**2.2x** (3.80 → 8.46 tokens/s at k=6) with identical output: 3.7 tokens per round trip
+even at 45% acceptance.
+
+**Same models, no latency (loopback):**
+
+- model: `HuggingFaceTB/SmolLM2-360M` (32 layers), float32 on cpu; draft: `HuggingFaceTB/SmolLM2-135M`
+- stages: 2 (0-15, 16-31), relay and workers are separate processes on one machine (arm, Darwin)
+- network: no simulated latency (loopback)
+- prompt: 37 tokens, generated: 48 tokens, greedy
+
+| mode | prefill, ms | per token, ms (median) | tokens/s | same tokens as full model | notes |
+|---|---:|---:|---:|:---:|---|
+| single process (no network) | 190 | 50 | 19.78 | yes |  |
+| long-poll + KV cache, request per stage | 323 | 60 | 16.04 | yes |  |
+| + relay-side route, request per token | 323 | 58 | 16.57 | yes |  |
+| + speculative decoding, k=2 | 551 | 83 | 10.12 | yes | acceptance 74%, 2.4 tokens/round |
+| + speculative decoding, k=4 | 516 | 59 | 12.68 | yes | acceptance 58%, 3.2 tokens/round |
+| + speculative decoding, k=6 | 550 | 56 | 12.67 | yes | acceptance 45%, 3.7 tokens/round |
+
+Hidden-state transfer for the 37-token prompt (bf16, hidden size 960): legacy format 139 KiB, new format 69 KiB (2.0x smaller).
+
+Without latency speculative decoding *loses* (12.7 vs 16.6 tokens/s): the draft is only
+~2.7x smaller than the target and runs on the same CPU, so drafting costs as much as it
+saves. It pays off when round trips dominate — exactly the distributed case — and with a
+much smaller draft relative to the target (e.g. 0.5B draft for a 7B+ target).
+
+Reproduce:
+
+```bash
+uv run python benchmarks/bench_pipeline.py --model-id HuggingFaceTB/SmolLM2-360M \
+    --draft-model-id HuggingFaceTB/SmolLM2-135M --new-tokens 48 \
+    --worker-rtt-ms 60 --client-rtt-ms 20 --modes distllm,route,spec-2,spec-4,spec-6
+```
+
 ### Limitations
 
 - Batch size 1 and greedy decoding.
