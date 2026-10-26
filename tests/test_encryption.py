@@ -105,3 +105,38 @@ async def test_key_mismatch_fails_the_task_instead_of_hanging(asgi):
     assert "set DISTLLM_PAYLOAD_KEY" in str(result)
     result, _ = await _run(asgi, KEY, None, {"x": 1})
     assert "unencrypted" in str(result)
+
+
+
+class _ReplayingRelay(httpx.AsyncBaseTransport):
+    """A malicious relay: answers every result request with a recorded earlier result."""
+
+    def __init__(self, inner):
+        self.inner, self.recorded = inner, None
+
+    async def handle_async_request(self, request):
+        resp = await self.inner.handle_async_request(request)
+        if "/get_result/" in request.url.path and resp.status_code == 200:
+            body = await resp.aread()
+            if resp.headers.get("content-type") == "application/octet-stream":
+                if self.recorded is None:
+                    self.recorded = body
+                return httpx.Response(200, content=self.recorded, headers={"content-type": "application/octet-stream"})
+            return httpx.Response(resp.status_code, content=body, headers=resp.headers)
+        return resp
+
+
+@pytest.mark.asyncio
+async def test_relay_cannot_answer_with_another_requests_result(asgi):
+    w = Worker("s0", "http://relay", node_id="s0", payload_key=KEY)
+    w.client = httpx.AsyncClient(transport=asgi, base_url="http://relay")
+    worker = asyncio.create_task(w.run(lambda p: {"echo": p["x"]}))
+    cluster = Cluster("http://relay", payload_key=KEY)
+    cluster.client = httpx.AsyncClient(transport=_ReplayingRelay(asgi), base_url="http://relay")
+    try:
+        assert await cluster.call("s0", {"x": 1}, timeout=10) == {"echo": 1}  # rid stripped
+        with pytest.raises(PayloadDecryptionError, match="another request"):
+            await cluster.call("s0", {"x": 2}, timeout=10)  # gets the sealed result of x=1
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)

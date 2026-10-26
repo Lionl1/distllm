@@ -5,7 +5,7 @@ import time
 import httpx
 import functools
 from typing import Callable, Optional
-from .crypto import PayloadDecryptionError, cipher_from, is_sealed
+from .crypto import RID_KEY, PayloadDecryptionError, cipher_from, is_sealed
 from .transport import pack_payload, unpack_payload
 
 def _auth_headers(token: Optional[str]) -> dict:
@@ -109,6 +109,8 @@ class Worker:
             tasks = [(task_id, payload) for task_id, payload in tasks if task_id not in bad]
             if not tasks:
                 return
+        # Encrypted requests carry an id that the result must echo (see Cluster.wait_for).
+        rids = {task_id: payload.pop(RID_KEY, None) for task_id, payload in tasks if isinstance(payload, dict)}
         ids = ", ".join(task_id for task_id, _ in tasks)
         print(f"[+] Processing {ids}...")
         if self.batched:
@@ -126,10 +128,12 @@ class Worker:
                 except Exception as e:
                     results.append(e)
         await asyncio.gather(*(
-            self._report(task_id, result) for (task_id, _), result in zip(tasks, results)
+            self._report(task_id, result, rids.get(task_id)) for (task_id, _), result in zip(tasks, results)
         ))
 
-    async def _report(self, task_id: str, result) -> None:
+    async def _report(self, task_id: str, result, rid: Optional[str] = None) -> None:
+        if rid is not None and isinstance(result, dict):
+            result = {**result, RID_KEY: rid}
         if not isinstance(result, Exception):
             try:
                 body = pack_payload(result)
@@ -310,6 +314,13 @@ class Cluster:
         self.cipher = cipher_from(payload_key)
         self.node_id = "client-" + str(uuid.uuid4())[:8]
         self.poll_interval = poll_interval
+        self._rids = {}  # task_id -> request id expected back in the sealed result
+
+    def _check_rid(self, task_id: str, result):
+        expected = self._rids.pop(task_id, None)
+        if expected is not None and (not isinstance(result, dict) or result.pop(RID_KEY, None) != expected):
+            raise PayloadDecryptionError(f"Result of task {task_id} belongs to another request (replayed?)")
+        return result
 
     async def __aenter__(self):
         return self
@@ -332,6 +343,12 @@ class Cluster:
         up to SUBMIT_RETRY_FOR seconds; a duplicate submission is harmless because stages
         check start_pos.
         """
+        rid = None
+        if self.cipher and isinstance(payload, dict):
+            # Sealed with the request and echoed sealed by every stage of a route: the relay
+            # cannot answer this request with a (validly encrypted) result of another one.
+            rid = uuid.uuid4().hex
+            payload = {**payload, RID_KEY: rid}
         data = pack_payload(payload)
         if self.cipher:
             data = self.cipher.seal(data)
@@ -360,7 +377,10 @@ class Cluster:
         if resp.status_code == 401:
             raise RelayAuthError("Relay rejected the client token (set DISTLLM_TOKEN)")
         resp.raise_for_status()
-        return resp.json()["task_id"]
+        task_id = resp.json()["task_id"]
+        if rid:
+            self._rids[task_id] = rid
+        return task_id
 
     async def wait_for(self, task_id: str, timeout: float = 60.0) -> dict:
         """Waits for the result of a task (long-poll by default)."""
@@ -385,7 +405,7 @@ class Cluster:
                     continue
                 if resp.status_code == 200:
                     if resp.headers.get("content-type") == "application/octet-stream":
-                        return unpack_payload(_open(self.cipher, resp.content))
+                        return self._check_rid(task_id, unpack_payload(_open(self.cipher, resp.content)))
                     try:
                         data = resp.json()
                     except ValueError:

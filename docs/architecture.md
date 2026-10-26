@@ -113,9 +113,11 @@ travels as a URL flag; a sealed body never parses as a msgpack dict).
 - Not hidden from **workers**: a stage must decrypt its input to compute. Encryption
   protects against the relay and the network, not against a stage you do not trust (see
   the privacy notes in self-hosted.md and auditing).
-- The relay can still drop, delay or replay sealed messages; a replayed result is
-  harmless (the client takes the first result per task) and stage outputs are checked by
-  auditing when enabled.
+- The relay can still drop or delay sealed messages. Replays do not pass: the client seals a
+  random request id into each payload, every stage echoes it in its sealed result, and a
+  result with another id is rejected (`PayloadDecryptionError`). A replayed *task* can only
+  reset or rewind a stage's cache, which the next step detects as `cache_miss` and repairs
+  with a prefix replay — the output stays correct.
 - Cost: ~0.7 GiB/s on an M1 core, 0.08 ms for a 65 KiB hidden state.
 
 ### Latency simulation

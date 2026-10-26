@@ -6,8 +6,9 @@ result is sealed with ChaCha20-Poly1305 before it leaves the process:
     b"DLE1" | 12-byte random nonce | ciphertext + 16-byte tag
 
 The relay still sees what it needs to route: roles, the session id, sizes, timing and the
-``stop_chain`` flag (sent as a URL parameter). It can drop, delay or replay a sealed
-message, but not read or change one: a modified message fails authentication.
+``stop_chain`` flag (sent as a URL parameter). It can drop or delay a sealed message, but
+not read or change one: a modified message fails authentication, and a result replayed
+for another request carries the wrong request id (``RID_KEY``) and is rejected.
 """
 
 import base64
@@ -19,6 +20,9 @@ from typing import Optional
 MAGIC = b"DLE1"
 NONCE_SIZE = 12
 KEY_ENV = "DISTLLM_PAYLOAD_KEY"
+# Request id inside sealed payloads; results echo it so that the relay cannot answer one
+# request with the (validly sealed) result of another.
+RID_KEY = "_distllm_rid"
 # Passphrases are stretched with scrypt. The salt is fixed because every node must derive
 # the same key from the same passphrase; a generated key (`distllm keygen`) skips this.
 _SCRYPT_SALT = b"distllm-payload-key-v1"
