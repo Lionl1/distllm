@@ -99,7 +99,9 @@ class Task:
         self.result = None
         self.created_at = time.time()
         self.completed_at = None
-        # Set when the task reaches COMPLETED/FAILED; long-polling clients wait on it.
+        # Set when the task needs no more work: COMPLETED/FAILED, or FORWARDED for an
+        # intermediate step of a chain. A chain's root is set only when the chain ends.
+        # Long-polling clients wait on it; cleanup uses it to tell live tasks from dead ones.
         self.done = asyncio.Event()
 
 # --- Registry State ---
@@ -118,7 +120,10 @@ NODE_TIMEOUT = 30.0 # Seconds before a node is considered dead (3x heartbeat int
 MAX_RESULT_WAIT = 60.0 # Upper bound for long-poll in /get_result
 FINISHED = ("COMPLETED", "FAILED", "FORWARDED")
 # A worker result containing this key ends a chain early (e.g. a stage cache miss).
+# Workers flag it with ?stop_chain=1; small bodies are also inspected for compatibility.
 STOP_CHAIN_KEY = "stop_chain"
+STOP_CHAIN_SNIFF_LIMIT = 4096  # bytes; hidden-state payloads are never decoded by the relay
+MAX_ERROR_LENGTH = 8000
 
 # --- Background Tasks ---
 async def cleanup_stuck_tasks():
@@ -139,11 +144,12 @@ def cleanup_old_tasks():
     now = time.time()
     to_delete = []
     for tid, task in list(tasks.items()):
-        # Clean up completed or failed tasks after 5 minutes
-        if task.status in FINISHED and task.completed_at and (now - task.completed_at > 300.0):
+        # Clean up finished tasks after 5 minutes. A chain root stays FORWARDED (not done)
+        # while later stages run — it must survive however long they take.
+        if task.done.is_set() and task.completed_at and (now - task.completed_at > 300.0):
             to_delete.append(tid)
         # Clean up stuck/dangling tasks older than 30 minutes
-        elif task.status not in FINISHED and (now - task.created_at > 1800.0):
+        elif not task.done.is_set() and (now - task.created_at > 1800.0):
             to_delete.append(tid)
             
     for tid in to_delete:
@@ -237,6 +243,31 @@ async def submit_task(request: Request, target_role: str, sender_id: str, route:
     await _enqueue(Task(task_id, sender_id, target_role, body, route=next_roles))
     return {"task_id": task_id}
 
+async def _queue_get(queue: asyncio.Queue, timeout: float) -> Optional[str]:
+    """queue.get() with a timeout that never loses an item.
+
+    asyncio.wait_for(queue.get(), t) may discard an item dequeued right as the
+    timeout fires (Python < 3.12); that task would stay PENDING outside any queue.
+    """
+    getter = asyncio.ensure_future(queue.get())
+    try:
+        done, _ = await asyncio.wait({getter}, timeout=timeout)
+    except asyncio.CancelledError:
+        # The request itself was cancelled (shutdown/disconnect): give the item back.
+        getter.cancel()
+        if getter.done() and not getter.cancelled():
+            queue.put_nowait(getter.result())
+        raise
+    if not done:
+        getter.cancel()
+        try:
+            await getter
+        except asyncio.CancelledError:
+            return None
+    # The getter may have completed during cancellation: keep its item.
+    return getter.result()
+
+
 @app.get("/poll/{role}")
 async def poll_task(role: str, worker_id: str):
     """Workers call this to fetch a pending task."""
@@ -245,38 +276,49 @@ async def poll_task(role: str, worker_id: str):
     if role not in pending_queues:
         pending_queues[role] = asyncio.Queue()
 
-    try:
-        # Wait up to 5s for a task (long polling)
-        task_id = await asyncio.wait_for(pending_queues[role].get(), timeout=5.0)
-        task = tasks.get(task_id)
-        if not task:
-            return Response(status_code=204)
-        
-        # Double check task hasn't been completed/assigned already
-        if task.status != "PENDING":
-             return Response(status_code=204)
-
-        task.status = "ASSIGNED"
-        task.worker_id = worker_id
-        task.assigned_at = time.time()
-        
-        # We need to return the task_id AND the payload.
-        # Since we want to avoid JSON encoding binary data, 
-        # let's pack the whole response into msgpack and return it as bytes.
-        response_data = pack_payload({
-            "task_id": task.task_id,
-            "payload": task.payload # This is already bytes from submit
-        })
-        return Response(content=response_data, media_type="application/octet-stream")
-    except asyncio.TimeoutError:
+    # Wait up to 5s for a task (long polling)
+    task_id = await _queue_get(pending_queues[role], timeout=5.0)
+    if task_id is None:
+        return Response(status_code=204)
+    task = tasks.get(task_id)
+    if not task:
         return Response(status_code=204)
 
-def _stops_chain(body: bytes) -> bool:
+    # Double check task hasn't been completed/assigned already
+    if task.status != "PENDING":
+         return Response(status_code=204)
+
+    task.status = "ASSIGNED"
+    task.worker_id = worker_id
+    task.assigned_at = time.time()
+
+    # We need to return the task_id AND the payload.
+    # Since we want to avoid JSON encoding binary data, 
+    # let's pack the whole response into msgpack and return it as bytes.
+    response_data = pack_payload({
+        "task_id": task.task_id,
+        "payload": task.payload # This is already bytes from submit
+    })
+    return Response(content=response_data, media_type="application/octet-stream")
+
+def _stops_chain(body: bytes, flagged: bool) -> bool:
+    if flagged:
+        return True
+    # Workers flag it explicitly; sniff only tiny bodies (a cache-miss answer is a few
+    # bytes) so that hidden states are never decoded on the relay's event loop.
+    if len(body) > STOP_CHAIN_SNIFF_LIMIT:
+        return False
     try:
         result = msgpack.unpackb(body, raw=False)
     except Exception:  # noqa: BLE001 — not a msgpack dict: just forward it
         return False
     return isinstance(result, dict) and bool(result.get(STOP_CHAIN_KEY))
+
+
+def _check_worker(task: Task, worker_id: Optional[str]) -> None:
+    """Only the worker a task is assigned to may complete it (when it identifies itself)."""
+    if worker_id is not None and task.worker_id is not None and worker_id != task.worker_id:
+        raise HTTPException(status_code=409, detail="task is assigned to another worker")
 
 
 def _finish(task: Task, status: str, result: bytes) -> None:
@@ -292,7 +334,9 @@ def _finish(task: Task, status: str, result: bytes) -> None:
 
 
 @app.post("/result/{task_id}")
-async def post_result(task_id: str, request: Request):
+async def post_result(
+    task_id: str, request: Request, worker_id: Optional[str] = None, stop_chain: bool = False
+):
     """Workers submit the result of a task."""
     if task_id not in tasks:
         raise HTTPException(status_code=404)
@@ -302,10 +346,13 @@ async def post_result(task_id: str, request: Request):
     # Задача могла быть переотдана другому воркеру после таймаута: первый результат побеждает.
     if task.status in FINISHED:
         return {"status": "ignored"}
+    _check_worker(task, worker_id)
 
-    if task.route and not _stops_chain(body):
+    if task.route and not _stops_chain(body, stop_chain):
         task.status = "FORWARDED"
         task.completed_at = time.time()
+        if task.task_id != task.root_id:
+            task.done.set()  # nobody waits on an intermediate step
         await _enqueue(Task(
             str(uuid.uuid4()), task.sender_id, task.route[0], body,
             route=task.route[1:], root_id=task.root_id,
@@ -316,15 +363,24 @@ async def post_result(task_id: str, request: Request):
     return {"status": "ok"}
 
 @app.post("/fail/{task_id}")
-async def post_failure(task_id: str, error_msg: str):
-    """Workers report a failed task execution."""
+async def post_failure(
+    task_id: str, request: Request, error_msg: Optional[str] = None, worker_id: Optional[str] = None
+):
+    """Workers report a failed task execution.
+
+    The message goes in the request body (plain text); ``?error_msg=`` is still
+    accepted, but long messages (tracebacks) do not fit into a URL.
+    """
     if task_id not in tasks:
         raise HTTPException(status_code=404)
     
     task = tasks[task_id]
     if task.status in FINISHED:
         return {"status": "ignored"}
-    _finish(task, "FAILED", error_msg.encode("utf-8"))
+    _check_worker(task, worker_id)
+    body = (await request.body()).decode("utf-8", errors="replace")
+    message = (body or error_msg or "unknown error")[:MAX_ERROR_LENGTH]
+    _finish(task, "FAILED", message.encode("utf-8"))
     return {"status": "ok"}
 
 @app.get("/get_result/{task_id}")

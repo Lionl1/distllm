@@ -99,17 +99,25 @@ class Worker:
                                     result = await asyncio.to_thread(func, input_payload)
                                 
                                 result_bytes = pack_payload(result)
-                                await self.client.post(f"{self.relay_url}/result/{task_id}", content=result_bytes)
-                                print(f"[v] Task {task_id} completed.")
                             except Exception as e:
                                 print(f"[!] Task {task_id} failed with error: {e}")
                                 try:
+                                    # In the body: tracebacks do not fit into a URL.
                                     await self.client.post(
-                                        f"{self.relay_url}/fail/{task_id}", 
-                                        params={"error_msg": str(e)}
+                                        f"{self.relay_url}/fail/{task_id}",
+                                        params={"worker_id": self.node_id},
+                                        content=f"{type(e).__name__}: {e}".encode("utf-8"),
                                     )
                                 except Exception as post_err:
                                     print(f"[!] Failed to report task failure to relay: {post_err}")
+                            else:
+                                params = {"worker_id": self.node_id}
+                                if isinstance(result, dict) and result.get("stop_chain"):
+                                    params["stop_chain"] = "true"
+                                await self.client.post(
+                                    f"{self.relay_url}/result/{task_id}", content=result_bytes, params=params
+                                )
+                                print(f"[v] Task {task_id} completed.")
                     elif resp.status_code == 204:
                         pass # No tasks
                     elif resp.status_code == 401:

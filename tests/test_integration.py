@@ -73,7 +73,7 @@ async def test_failing_worker_integration(relay_server):
             with pytest.raises(RuntimeError) as exc_info:
                 await cluster.wait_for(task_id, timeout=10)
             
-            assert "Task failed on worker: simulated processing error" in str(exc_info.value)
+            assert "Task failed on worker: ValueError: simulated processing error" in str(exc_info.value)
             
     finally:
         p_worker.terminate()

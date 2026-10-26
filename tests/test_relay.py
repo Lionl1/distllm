@@ -275,3 +275,73 @@ def test_failure_in_chain_fails_root():
     client.post(f"/fail/{b['task_id']}", params={"error_msg": "boom"})
 
     assert client.get(f"/get_result/{root_id}").json() == {"status": "FAILED", "error": "boom"}
+
+
+# --- robustness (review fixes) ---
+
+def test_chain_root_survives_cleanup_while_chain_runs():
+    from distllm.relay import cleanup_old_tasks
+
+    root_id = client.post(
+        "/submit", content=pack_payload({}),
+        params={"target_role": "slow-a", "sender_id": "c", "route": "slow-b"},
+    ).json()["task_id"]
+    _poll("slow-a")
+    client.post(f"/result/{root_id}", content=pack_payload({"h": 1}))
+    # Следующая стадия долго грузит модель: прошло больше 5 минут.
+    tasks[root_id].completed_at = (tasks[root_id].completed_at or time.time()) - 600
+    cleanup_old_tasks()
+    assert root_id in tasks
+
+    b = _poll("slow-b")
+    client.post(f"/result/{b['task_id']}", content=pack_payload({"final": 1}))
+    assert unpack_payload(client.get(f"/get_result/{root_id}").content) == {"final": 1}
+
+
+@pytest.mark.asyncio
+async def test_queue_get_returns_item_ready_at_timeout():
+    from distllm.relay import _queue_get
+
+    q = asyncio.Queue()
+    q.put_nowait("t1")
+    assert await _queue_get(q, timeout=0) == "t1"
+    assert await _queue_get(q, timeout=0.01) is None
+
+
+def test_failure_message_in_body_and_truncated():
+    task_id = client.post(
+        "/submit", content=pack_payload({}), params={"target_role": "long-err", "sender_id": "c"},
+    ).json()["task_id"]
+    long_error = "Traceback " + "x" * 50_000
+    assert client.post(f"/fail/{task_id}", content=long_error.encode()).json() == {"status": "ok"}
+    error = client.get(f"/get_result/{task_id}").json()["error"]
+    assert error.startswith("Traceback") and len(error) <= 8000
+
+
+def test_stop_chain_flag_and_large_bodies_not_decoded(monkeypatch):
+    import distllm.relay as relay
+
+    root_id = client.post(
+        "/submit", content=pack_payload({}),
+        params={"target_role": "sc-a", "sender_id": "c", "route": "sc-b"},
+    ).json()["task_id"]
+    _poll("sc-a")
+    calls = []
+    monkeypatch.setattr(relay.msgpack, "unpackb", lambda *a, **k: calls.append(1) or {})
+    big = b"\x00" * (relay.STOP_CHAIN_SNIFF_LIMIT + 1)
+    client.post(f"/result/{root_id}", content=big, params={"stop_chain": "true"})
+    assert calls == []  # флаг в запросе — тело не разбирается
+    assert client.get(f"/get_result/{root_id}").content == big
+
+
+def test_result_from_other_worker_rejected():
+    task_id = client.post(
+        "/submit", content=pack_payload({}), params={"target_role": "own", "sender_id": "c"},
+    ).json()["task_id"]
+    _poll("own", worker_id="owner")
+
+    forged = client.post(f"/result/{task_id}", content=pack_payload({"y": "forged"}), params={"worker_id": "intruder"})
+    assert forged.status_code == 409
+    ok = client.post(f"/result/{task_id}", content=pack_payload({"y": "real"}), params={"worker_id": "owner"})
+    assert ok.json() == {"status": "ok"}
+    assert unpack_payload(client.get(f"/get_result/{task_id}").content) == {"y": "real"}
