@@ -247,6 +247,10 @@ class Cluster:
         params = {"target_role": role, "sender_id": self.node_id}
         if route:
             params["route"] = ",".join(route)
+        session = payload.get("session_id") if isinstance(payload, dict) else None
+        if isinstance(session, str) and session:
+            # Keeps the session on the replica that holds its KV cache.
+            params["session"] = session
         resp = await self.client.post(
             f"{self.relay_url}/submit", 
             content=data, 

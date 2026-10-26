@@ -145,8 +145,9 @@ async with Cluster("http://relay:8000") as cluster:
 - Decoder-only `*ForCausalLM` checkpoints whose tensor names match the model (Llama,
   Qwen2/2.5/3, Mistral, SmolLM, ...); multimodal checkpoints are rejected with a clear error.
 - Quantization: bitsandbytes nf4/fp4/int8 (no GPTQ/AWQ checkpoints).
-- One worker per stage role: replicas of a role do not share or pin KV caches, so a request
-  that lands on another replica triggers a replay.
+- Replicas of a stage role are supported: the relay keeps each session on the replica that
+  holds its KV cache and moves it (with a replay) only when that worker is gone. Replicas do
+  not share load within one session.
 - The relay keeps its state in memory: a relay restart loses in-flight tasks (clients recover
   by replaying the prefix, but tasks queued for workers that are still loading are lost).
 - Tested on CPU (macOS/Linux); GPU paths (CUDA, bitsandbytes on CUDA) are not covered by CI.

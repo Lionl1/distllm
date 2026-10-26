@@ -136,14 +136,16 @@ tokenizer).
 
 ## 6. Day-to-day
 
-- **Someone leaves or reboots**: generation waits until the role is served again (same
-  command on any machine), then the client replays the prefix and continues with the same
+- **Someone leaves or reboots**: with a replica of their role online, the session moves
+  there right away; otherwise generation waits until the role is served again (same command
+  on any machine). Either way the client replays the prefix and continues with the same
   output. Nothing to restart on your side.
 - **Several people generating at once** works — each session has its own KV cache on
   every stage (8 sessions per stage by default) — but a worker computes one request at a
   time, so users slow each other down. There is no batching yet.
-- **One worker per role.** Two friends serving the same role is allowed, but the KV cache
-  is not pinned to one of them: requests that land on the other one cause replays.
+- **Several friends may serve the same role** (replicas): the relay keeps each session on
+  the replica that holds its KV cache, so different sessions spread over replicas without
+  replays. If that friend leaves, the session moves to another replica (one replay).
 - **Speed** is dominated by round trips: with ~60 ms to the relay expect a few tokens per
   second for a 2-stage pipeline, up to ~2× more with speculative decoding
   ([benchmarks](benchmarks.md), simulated latency).

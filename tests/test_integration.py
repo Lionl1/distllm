@@ -28,9 +28,16 @@ def run_failing_worker():
 
 @pytest.fixture(scope="module")
 def relay_server():
+    import socket
+
     p = multiprocessing.Process(target=run_relay)
     p.start()
-    time.sleep(2) # Wait for startup
+    deadline = time.time() + 30
+    while time.time() < deadline:  # wait until the relay accepts connections
+        with socket.socket() as sock:
+            if sock.connect_ex(("127.0.0.1", 8002)) == 0:
+                break
+        time.sleep(0.2)
     yield "http://localhost:8002"
     p.terminate()
 
@@ -132,6 +139,46 @@ async def test_hf_pipeline_over_relay(relay_server):
         assert routed_result.token_ids == expected
         assert speculative_result.token_ids == expected
         assert speculative_result.rounds < 6
+    finally:
+        for p in workers:
+            p.terminate()
+
+
+def run_stage_replica(layer_start, layer_end, role, node_id):
+    from distllm.hf import load_stage
+
+    stage = load_stage(TINY_LLAMA, layer_start, layer_end, device="cpu", dtype="float32")
+
+    @worker_node(role=role, relay_url="http://localhost:8002")
+    def process(payload):
+        return stage.handle(payload)
+
+    process.start(node_id=node_id)
+
+
+@pytest.mark.asyncio
+async def test_replicas_keep_sessions_without_replays(relay_server):
+    """Two replicas per stage: affinity keeps each session on the replica with its cache."""
+    from distllm.hf import PipelineGenerator
+
+    workers = [
+        multiprocessing.Process(target=run_stage_replica, args=(0, 0, "rep-stage-0", f"r0-{i}"))
+        for i in range(2)
+    ] + [
+        multiprocessing.Process(target=run_stage_replica, args=(1, 1, "rep-stage-1", f"r1-{i}"))
+        for i in range(2)
+    ]
+    for p in workers:
+        p.start()
+    try:
+        prompt = torch.tensor([[1, 5, 9, 13, 21, 34, 55]])
+        async with Cluster(relay_server) as cluster:
+            generator = PipelineGenerator(cluster.call, ["rep-stage-0", "rep-stage-1"])
+            results = await asyncio.wait_for(
+                asyncio.gather(*(generator.generate(prompt, 8) for _ in range(3))), timeout=180
+            )
+        assert all(r.cache_recoveries == 0 for r in results)
+        assert all(r.token_ids == results[0].token_ids for r in results)
     finally:
         for p in workers:
             p.terminate()
