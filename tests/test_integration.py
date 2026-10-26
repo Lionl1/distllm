@@ -1,6 +1,11 @@
 import asyncio
 import torch
 import multiprocessing
+
+# Never fork: the test process has already run torch (its OpenMP thread pool is up), and
+# a forked child can inherit a held lock and hang on its first forward. "fork" is the
+# default on Linux (it made test_replicas_keep_sessions_without_replays hang in CI).
+SPAWN = multiprocessing.get_context("spawn")
 import time
 import pytest
 from distllm import worker_node, Cluster, start_relay
@@ -41,7 +46,7 @@ def relay_server():
         p = subprocess.Popen([binary, "--port", "8002", "--host", "0.0.0.0"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        p = multiprocessing.Process(target=run_relay)
+        p = SPAWN.Process(target=run_relay)
         p.start()
     deadline = time.time() + 30
     while time.time() < deadline:  # wait until the relay accepts connections
@@ -55,7 +60,7 @@ def relay_server():
 @pytest.mark.asyncio
 async def test_full_integration(relay_server):
     # Start worker in a separate process
-    p_worker = multiprocessing.Process(target=run_worker)
+    p_worker = SPAWN.Process(target=run_worker)
     p_worker.start()
     
     try:
@@ -77,7 +82,7 @@ async def test_full_integration(relay_server):
 @pytest.mark.asyncio
 async def test_failing_worker_integration(relay_server):
     # Start failing worker in a separate process
-    p_worker = multiprocessing.Process(target=run_failing_worker)
+    p_worker = SPAWN.Process(target=run_failing_worker)
     p_worker.start()
     
     try:
@@ -129,8 +134,8 @@ async def test_hf_pipeline_over_relay(relay_server):
             seq = torch.cat([seq, torch.tensor([[nxt]])], dim=1)
 
     workers = [
-        multiprocessing.Process(target=run_stage_worker, args=(0, 0, "hf-stage-0")),
-        multiprocessing.Process(target=run_stage_worker, args=(1, 1, "hf-stage-1")),
+        SPAWN.Process(target=run_stage_worker, args=(0, 0, "hf-stage-0")),
+        SPAWN.Process(target=run_stage_worker, args=(1, 1, "hf-stage-1")),
     ]
     for p in workers:
         p.start()
@@ -173,10 +178,10 @@ async def test_replicas_keep_sessions_without_replays(relay_server):
     from distllm.hf import PipelineGenerator
 
     workers = [
-        multiprocessing.Process(target=run_stage_replica, args=(0, 0, "rep-stage-0", f"r0-{i}"))
+        SPAWN.Process(target=run_stage_replica, args=(0, 0, "rep-stage-0", f"r0-{i}"))
         for i in range(2)
     ] + [
-        multiprocessing.Process(target=run_stage_replica, args=(1, 1, "rep-stage-1", f"r1-{i}"))
+        SPAWN.Process(target=run_stage_replica, args=(1, 1, "rep-stage-1", f"r1-{i}"))
         for i in range(2)
     ]
     for p in workers:
@@ -213,8 +218,8 @@ async def test_batched_workers_serve_concurrent_sessions(relay_server):
     from distllm.hf import PipelineGenerator
 
     workers = [
-        multiprocessing.Process(target=run_batched_stage, args=(0, 0, "batch-stage-0")),
-        multiprocessing.Process(target=run_batched_stage, args=(1, 1, "batch-stage-1")),
+        SPAWN.Process(target=run_batched_stage, args=(0, 0, "batch-stage-0")),
+        SPAWN.Process(target=run_batched_stage, args=(1, 1, "batch-stage-1")),
     ]
     for p in workers:
         p.start()
