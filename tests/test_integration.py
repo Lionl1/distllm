@@ -77,3 +77,51 @@ async def test_failing_worker_integration(relay_server):
             
     finally:
         p_worker.terminate()
+
+
+TINY_LLAMA = "hf-internal-testing/tiny-random-LlamaForCausalLM"
+
+
+def run_stage_worker(layer_start, layer_end, role):
+    from distllm.hf import load_stage
+
+    stage = load_stage(TINY_LLAMA, layer_start, layer_end, device="cpu", dtype="float32")
+
+    @worker_node(role=role, relay_url="http://localhost:8002")
+    def process(payload):
+        return stage.handle(payload)
+
+    process.start(node_id=role)
+
+
+@pytest.mark.asyncio
+async def test_hf_pipeline_over_relay(relay_server):
+    """Two stage processes behind the relay generate exactly what the full model does."""
+    pytest.importorskip("transformers")
+    from transformers import AutoModelForCausalLM
+    from distllm.hf import PipelineGenerator
+
+    prompt = torch.tensor([[1, 5, 9, 13, 21, 34, 55]])
+    model = AutoModelForCausalLM.from_pretrained(TINY_LLAMA, dtype=torch.float32).eval()
+    seq, expected = prompt, []
+    with torch.inference_mode():
+        for _ in range(6):
+            nxt = int(model(seq).logits[0, -1].argmax())
+            expected.append(nxt)
+            seq = torch.cat([seq, torch.tensor([[nxt]])], dim=1)
+
+    workers = [
+        multiprocessing.Process(target=run_stage_worker, args=(0, 0, "hf-stage-0")),
+        multiprocessing.Process(target=run_stage_worker, args=(1, 1, "hf-stage-1")),
+    ]
+    for p in workers:
+        p.start()
+    try:
+        async with Cluster(relay_server) as cluster:
+            generator = PipelineGenerator(cluster.call, ["hf-stage-0", "hf-stage-1"])
+            # Workers load the model on start; the first tasks wait in the relay queue.
+            result = await asyncio.wait_for(generator.generate(prompt, 6), timeout=120)
+        assert result.token_ids == expected
+    finally:
+        for p in workers:
+            p.terminate()
