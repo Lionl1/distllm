@@ -55,7 +55,8 @@ export DISTLLM_TOKEN=$(openssl rand -hex 24)
 uv run distllm relay --port 8000
 ```
 
-In two more terminals (or two Colab notebooks — see [docs/colab.md](docs/colab.md)):
+On any machines that can reach the relay — your PCs, friends' computers, a VPS, or Colab
+([self-hosted guide](docs/self-hosted.md), [Colab guide](docs/colab.md)):
 
 ```bash
 uv run python examples/distributed_hf/worker_hf.py --model-id Qwen/Qwen2.5-0.5B \
@@ -131,6 +132,8 @@ async with Cluster("http://relay:8000") as cluster:
 
 - [Architecture](docs/architecture.md) — relay API and task lifecycle, stage protocol,
   KV cache and recovery, routes, speculative decoding, transport, security.
+- [Your own machines, with friends](docs/self-hosted.md) — relay on a VPS / Tailscale, mixed hardware,
+  splitting layers (`examples/plan_split.py`), privacy and trust.
 - [Running on Google Colab](docs/colab.md) — relay behind a tunnel, workers in notebooks.
 - [Benchmarks](docs/benchmarks.md) — methodology, all results, how to reproduce.
 - [Changelog](CHANGELOG.md)
