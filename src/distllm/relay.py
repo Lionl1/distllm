@@ -326,40 +326,51 @@ async def _queue_get(queue: asyncio.Queue, timeout: float) -> Optional[str]:
     return await _queue_get_first([queue], timeout)
 
 
-@app.get("/poll/{role}")
-async def poll_task(role: str, worker_id: str):
-    """Workers call this to fetch a pending task."""
-    # Создаём очередь, если её нет (например, relay перезапустился), и ждём в ней:
-    # мгновенный 204 заставлял бы воркер крутиться в цикле запросов.
-    own_queue = _worker_queue(worker_id)
-    role_queue = _role_queue(role)
-
-    # Wait up to 5s for a task (long polling): this worker's sessions first.
-    task_id = await _queue_get_first([own_queue, role_queue], timeout=5.0)
-    if task_id is None:
-        return Response(status_code=204)
-    task = tasks.get(task_id)
-    if not task:
-        return Response(status_code=204)
-
-    # Double check task hasn't been completed/assigned already
-    if task.status != "PENDING":
-         return Response(status_code=204)
-
+def _take(task_id: Optional[str], worker_id: str) -> Optional[Task]:
+    """Assign a dequeued task to the worker (None if it is gone or already taken)."""
+    task = tasks.get(task_id) if task_id else None
+    if task is None or task.status != "PENDING":
+        return None
     task.status = "ASSIGNED"
     task.worker_id = worker_id
     task.assigned_at = time.time()
     if task.session:
         affinity[(task.target_role, task.session)] = (worker_id, task.assigned_at)
+    return task
 
-    # We need to return the task_id AND the payload.
-    # Since we want to avoid JSON encoding binary data, 
-    # let's pack the whole response into msgpack and return it as bytes.
-    response_data = pack_payload({
-        "task_id": task.task_id,
-        "payload": task.payload # This is already bytes from submit
-    })
-    return Response(content=response_data, media_type="application/octet-stream")
+
+@app.get("/poll/{role}")
+async def poll_task(role: str, worker_id: str, max_tasks: int = 1):
+    """Workers call this to fetch pending tasks.
+
+    Waits up to 5 s for the first task (this worker's sessions first, then the role
+    queue). With ``max_tasks > 1`` it also takes whatever else is already queued, up to
+    that many, so a batching worker can run them in one forward; the response is then
+    ``{"tasks": [{"task_id", "payload"}, ...]}`` instead of a single task.
+    """
+    own_queue = _worker_queue(worker_id)
+    role_queue = _role_queue(role)
+
+    # Wait up to 5s for a task (long polling): this worker's sessions first.
+    first = _take(await _queue_get_first([own_queue, role_queue], timeout=5.0), worker_id)
+    if first is None:
+        return Response(status_code=204)
+    taken = [first]
+    while len(taken) < max(1, max_tasks):
+        queue = own_queue if not own_queue.empty() else role_queue
+        if queue.empty():
+            break
+        task = _take(queue.get_nowait(), worker_id)
+        if task is not None:
+            taken.append(task)
+
+    # Payloads are already msgpack bytes from submit: wrap them without re-encoding.
+    if max_tasks <= 1:
+        body = {"task_id": first.task_id, "payload": first.payload}
+    else:
+        body = {"tasks": [{"task_id": t.task_id, "payload": t.payload} for t in taken]}
+    return Response(content=pack_payload(body), media_type="application/octet-stream")
+
 
 def _stops_chain(body: bytes, flagged: bool) -> bool:
     if flagged:

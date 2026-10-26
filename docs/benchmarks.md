@@ -152,3 +152,31 @@ two runs:
 | HuggingFaceTB/SmolLM2-360M | 14.8 | 20.0 | identical (16/16 tokens checked) |
 
 bfloat16 on MPS drifted from float32 after 6–11 tokens, so `dtype="auto"` uses float16 there.
+
+## Batched decode
+
+Several sessions decoding at once on one stage (`benchmarks/bench_batching.py`, in-process,
+SmolLM2-360M, all 32 layers in one stage, 16 decode steps per session after a 32-token
+prompt; tokens/s summed over sessions):
+
+**MPS, float16**
+
+|sessions | one by one, tok/s | batched, tok/s | speed-up |
+|---:|---:|---:|---:|
+| 1 | 18.8 | 18.9 | 1.00x |
+| 2 | 19.6 | 27.5 | 1.40x |
+| 4 | 20.2 | 38.4 | 1.90x |
+| 8 | 20.0 | 56.6 | 2.84x |
+
+**CPU, float32**
+
+|sessions | one by one, tok/s | batched, tok/s | speed-up |
+|---:|---:|---:|---:|
+| 1 | 14.9 | 14.8 | 0.99x |
+| 2 | 13.6 | 7.0 | 0.52x |
+| 4 | 13.4 | 14.3 | 1.06x |
+| 8 | 16.0 | 27.9 | 1.75x |
+
+On CPU, padding and cache copies make a batch of 2 slower than running the sessions one by
+one (0.5–0.8× over repeated runs); from 4 sessions batching wins (1.1–2.3×). CPU stages
+therefore batch only from 4 sessions (`PipelineStage.min_batch`), GPU/MPS stages from 2.

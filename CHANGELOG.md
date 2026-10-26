@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Batching: `PipelineStage.handle_batch` runs decode steps of concurrent sessions in one
+  forward (padded caches + attention mask); relay `/poll?max_tasks=`; `Worker(max_batch,
+  batched)`; `worker_hf.py --max-batch` (default 8). Up to 2.8× throughput on MPS with 8
+  sessions.
 - Auditing: `AuditConfig(roles, rate, min_similarity)` spot-checks the pipeline against
   trusted auditor stages and locates a stage that computes differently
   (`VerificationError`); client flags `--audit-roles --audit-rate`.

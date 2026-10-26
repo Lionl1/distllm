@@ -429,3 +429,15 @@ async def test_queue_get_first_prefers_first_queue_and_keeps_the_rest():
 
     asyncio.create_task(later())
     assert await _queue_get_first([own, shared], timeout=1) == "late"
+
+
+
+def test_poll_with_max_tasks_returns_a_batch():
+    client.post("/register", params={"node_id": "batcher", "role": "batch"})
+    ids = [_submit("batch") for _ in range(5)]
+    resp = client.get("/poll/batch", params={"worker_id": "batcher", "max_tasks": 3})
+    got = [t["task_id"] for t in unpack_payload(resp.content)["tasks"]]
+    assert got == ids[:3]
+    assert all(tasks[t].status == "ASSIGNED" and tasks[t].worker_id == "batcher" for t in got)
+    rest = unpack_payload(client.get("/poll/batch", params={"worker_id": "batcher", "max_tasks": 8}).content)
+    assert [t["task_id"] for t in rest["tasks"]] == ids[3:]

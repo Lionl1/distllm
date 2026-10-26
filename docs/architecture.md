@@ -150,6 +150,19 @@ the expected prefix answers `{"cache_miss": true, "cached": n, "stop_chain": tru
 forward fails midway (e.g. CUDA OOM), the session is dropped, because earlier layers have
 already appended to the cache.
 
+### Batching: `PipelineStage.handle_batch`
+
+A worker created with `worker_node(..., max_batch=8, batched=True)` polls with
+`?max_tasks=8`: the relay waits for the first task and adds whatever else is already queued
+(own queue first). `handle_batch(payloads)` runs the **decode steps** of different sessions
+(one new token at the end of a plain `DynamicCache`) in one forward: caches are left-padded
+to the longest and stacked, a 2-D attention mask hides the padding, every row gets its own
+`position_ids`; afterwards each session's cache is unpadded back. Everything else — prefill,
+`rewind`, `close`, cache misses, a session twice in one batch, sliding-window caches — runs
+one by one through `handle`. Results come back per request (an exception marks a failed
+one). Batched and unbatched logits match within 1e-4 (float32 tests); batching starts from
+`min_batch` decode steps (2 on GPU/MPS, 4 on CPU, where small batches are slower).
+
 ### Generation: `PipelineGenerator`
 
 ```

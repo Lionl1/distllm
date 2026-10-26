@@ -359,8 +359,12 @@ class PipelineStage:
         self.max_sessions = max(1, max_sessions)
         self.session_ttl = session_ttl
         self.name = name
+        # Fewest decode steps worth one batched forward. On CPU, padding and cache copies
+        # outweigh the gain for 2 sessions (measured 0.7x), it pays off from 4 (1.1-2.3x).
+        self.min_batch = 4 if device.type == "cpu" else 2
         self._sessions: "OrderedDict[str, _Session]" = OrderedDict()
-        self._lock = threading.Lock()
+        # Re-entrant: handle_batch() falls back to handle() for requests it cannot batch.
+        self._lock = threading.RLock()
 
     def _evict(self) -> None:
         now = time.time()
@@ -450,6 +454,126 @@ class PipelineStage:
             self._sessions.move_to_end(session_id)
             self._evict()
             return result
+
+
+    # ----------------------------------------------------------------------- #
+    # Batching: one forward for the decode steps of several sessions
+    # ----------------------------------------------------------------------- #
+
+    def _batchable(self, payload: dict) -> bool:
+        """A decode step (one new token at the end of an existing, plain cache)."""
+        from transformers.cache_utils import DynamicLayer
+
+        if payload.get("close"):
+            return False
+        sess = self._sessions.get(str(payload.get("session_id") or ""))
+        start_pos = int(payload.get("start_pos", 0))
+        if sess is None or start_pos == 0 or sess.length != start_pos:
+            return False
+        new = payload.get("input_ids") if self.is_first else payload.get("hidden_states")
+        if new is None or new.dim() < 2 or new.shape[0] != 1 or new.shape[1] != 1:
+            return False
+        # Sliding-window/offloaded layers keep a different layout: those run one by one.
+        return all(type(layer) is DynamicLayer and layer.is_initialized for layer in sess.cache.layers)
+
+    def handle_batch(self, payloads: list) -> list:
+        """Handle several requests; decode steps of different sessions share one forward.
+
+        Returns one result per payload, in order — or the exception it raised. Requests
+        that cannot be batched (prefill, rewind, close, repeated sessions, sliding-window
+        caches) are handled one by one with :meth:`handle`, exactly as before.
+        """
+        with self._lock:
+            sessions = [str(p.get("session_id") or "") for p in payloads]
+            batch = [
+                i for i, p in enumerate(payloads)
+                if sessions.count(sessions[i]) == 1 and self._batchable(p)
+            ]
+            if len(batch) < max(2, self.min_batch):
+                batch = []
+            results: list = [None] * len(payloads)
+            for i, payload in enumerate(payloads):
+                if i in batch:
+                    continue
+                try:
+                    results[i] = self.handle(payload)
+                except Exception as exc:  # noqa: BLE001 — reported per request
+                    results[i] = exc
+            if batch:
+                try:
+                    for i, result in zip(batch, self._decode_batch([payloads[i] for i in batch])):
+                        results[i] = result
+                except Exception as exc:  # noqa: BLE001
+                    for i in batch:
+                        self._sessions.pop(sessions[i], None)  # caches may be half-updated
+                        results[i] = exc
+            return results
+
+    def _decode_batch(self, payloads: list) -> list:
+        from transformers import DynamicCache
+
+        sessions = [self._sessions[str(p["session_id"])] for p in payloads]
+        lengths = [sess.length for sess in sessions]
+        longest = max(lengths)
+
+        # Left-pad every session's cache to the longest one and stack them.
+        batched = DynamicCache(config=self.config)
+        for index, layer in enumerate(batched.layers):
+            keys, values = [], []
+            for sess, length in zip(sessions, lengths):
+                k, v = sess.cache.layers[index].keys, sess.cache.layers[index].values
+                pad = longest - length
+                if pad:
+                    k = torch.cat([k.new_zeros(*k.shape[:2], pad, k.shape[-1]), k], dim=-2)
+                    v = torch.cat([v.new_zeros(*v.shape[:2], pad, v.shape[-1]), v], dim=-2)
+                keys.append(k)
+                values.append(v)
+            layer.lazy_initialization(keys[0], values[0])
+            layer.keys, layer.values = torch.cat(keys, dim=0), torch.cat(values, dim=0)
+
+        mask = torch.ones(len(payloads), longest + 1, dtype=torch.long, device=self.device)
+        for row, length in enumerate(lengths):
+            mask[row, : longest - length] = 0  # padding is never attended to
+        position_ids = torch.tensor(lengths, device=self.device).unsqueeze(1)
+        if self.is_first:
+            inputs = {"input_ids": torch.cat([p["input_ids"] for p in payloads]).to(self.device)}
+        else:
+            hidden = torch.cat([p["hidden_states"] for p in payloads]).to(self.device, self.dtype)
+            inputs = {"inputs_embeds": hidden}
+
+        with torch.inference_mode():
+            out = self.base(
+                **inputs,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=batched,
+                use_cache=True,
+            )
+            hidden = out.last_hidden_state  # (batch, 1, hidden)
+            results = []
+            for row, payload in enumerate(payloads):
+                h = hidden[row : row + 1]
+                if self.is_last and payload.get("output") == "argmax":
+                    results.append({"argmax": self.model.lm_head(h[0]).argmax(dim=-1).cpu()})
+                elif self.is_last:
+                    results.append({"logits": self.model.lm_head(h[:, -1, :]).float().cpu()})
+                else:
+                    result = {k: payload[k] for k in self.CONTROL_KEYS if k in payload}
+                    result["hidden_states"] = h.cpu()
+                    results.append(result)
+
+        # Unpad: every session keeps its own cache, now one token longer.
+        now = time.time()
+        for row, (payload, sess, length) in enumerate(zip(payloads, sessions, lengths)):
+            for index, layer in enumerate(batched.layers):
+                own = sess.cache.layers[index]
+                own.keys = layer.keys[row : row + 1, :, longest - length :, :].clone()
+                own.values = layer.values[row : row + 1, :, longest - length :, :].clone()
+            sess.length = length + 1
+            sess.last_used = now
+            self._sessions.move_to_end(str(payload["session_id"]))
+        self._evict()
+        return results
 
 
 # --------------------------------------------------------------------------- #

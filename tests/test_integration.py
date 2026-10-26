@@ -182,3 +182,42 @@ async def test_replicas_keep_sessions_without_replays(relay_server):
     finally:
         for p in workers:
             p.terminate()
+
+
+
+def run_batched_stage(layer_start, layer_end, role):
+    from distllm.hf import load_stage
+
+    stage = load_stage(TINY_LLAMA, layer_start, layer_end, device="cpu", dtype="float32")
+
+    @worker_node(role=role, relay_url="http://localhost:8002", max_batch=8, batched=True)
+    def process(payloads):
+        return stage.handle_batch(payloads)
+
+    process.start(node_id=role)
+
+
+@pytest.mark.asyncio
+async def test_batched_workers_serve_concurrent_sessions(relay_server):
+    from distllm.hf import PipelineGenerator
+
+    workers = [
+        multiprocessing.Process(target=run_batched_stage, args=(0, 0, "batch-stage-0")),
+        multiprocessing.Process(target=run_batched_stage, args=(1, 1, "batch-stage-1")),
+    ]
+    for p in workers:
+        p.start()
+    try:
+        prompts = [torch.tensor([[1, 5, 9, 13, 21, 34, 55]]), torch.tensor([[2, 4, 8]]),
+                   torch.tensor([[3, 1, 4, 1, 5, 9, 2, 6]]), torch.tensor([[7, 7]])]
+        async with Cluster(relay_server) as cluster:
+            generator = PipelineGenerator(cluster.call, ["batch-stage-0", "batch-stage-1"])
+            concurrent = await asyncio.wait_for(
+                asyncio.gather(*(generator.generate(p, 8) for p in prompts)), timeout=180
+            )
+            sequential = [await generator.generate(p, 8) for p in prompts]
+        assert [r.token_ids for r in concurrent] == [r.token_ids for r in sequential]
+        assert all(r.cache_recoveries == 0 for r in concurrent)
+    finally:
+        for p in workers:
+            p.terminate()

@@ -27,8 +27,16 @@ class Worker:
         node_id: str = None,
         idle_sleep: float = 0.0,
         token: Optional[str] = None,
+        max_batch: int = 1,
+        batched: bool = False,
     ):
+        """``max_batch > 1`` takes up to that many queued tasks per poll. With
+        ``batched=True`` the function receives a list of payloads and returns a list of
+        results (an Exception instance marks a failed item); otherwise the tasks run one
+        by one."""
         self.role = role
+        self.max_batch = max(1, max_batch)
+        self.batched = batched
         self.relay_url = relay_url.rstrip("/")
         self.node_id = node_id or str(uuid.uuid4())[:8]
         # Pause between polls. Not needed: /poll already long-polls on the relay.
@@ -62,6 +70,58 @@ class Worker:
             await asyncio.sleep(5)
 
     RESULT_RETRIES = 5
+
+    async def _call(self, func: Callable, arg):
+        if asyncio.iscoroutinefunction(func):
+            return await func(arg)
+        # Sync functions run in a thread so heartbeats keep flowing.
+        return await asyncio.to_thread(func, arg)
+
+    async def _process(self, func: Callable, tasks: list) -> None:
+        """Run tasks (one, or a batch with ``batched=True``) and upload every outcome."""
+        ids = ", ".join(task_id for task_id, _ in tasks)
+        print(f"[+] Processing {ids}...")
+        if self.batched:
+            try:
+                results = await self._call(func, [payload for _, payload in tasks])
+                if len(results) != len(tasks):
+                    raise RuntimeError(f"batch function returned {len(results)} results for {len(tasks)} tasks")
+            except Exception as e:  # the whole batch failed
+                results = [e] * len(tasks)
+        else:
+            results = []
+            for _, payload in tasks:
+                try:
+                    results.append(await self._call(func, payload))
+                except Exception as e:
+                    results.append(e)
+        await asyncio.gather(*(
+            self._report(task_id, result) for (task_id, _), result in zip(tasks, results)
+        ))
+
+    async def _report(self, task_id: str, result) -> None:
+        if not isinstance(result, Exception):
+            try:
+                body = pack_payload(result)
+            except Exception as e:  # unserializable result
+                result = e
+        if isinstance(result, Exception):
+            print(f"[!] Task {task_id} failed with error: {result}")
+            try:
+                # In the body: tracebacks do not fit into a URL.
+                await self.client.post(
+                    f"{self.relay_url}/fail/{task_id}",
+                    params={"worker_id": self.node_id},
+                    content=f"{type(result).__name__}: {result}".encode("utf-8"),
+                )
+            except Exception as post_err:
+                print(f"[!] Failed to report task failure to relay: {post_err}")
+            return
+        params = {"worker_id": self.node_id}
+        if isinstance(result, dict) and result.get("stop_chain"):
+            params["stop_chain"] = "true"
+        if await self._post_result(task_id, body, params):
+            print(f"[v] Task {task_id} completed.")
 
     async def _post_result(self, task_id: str, body: bytes, params: dict) -> bool:
         """Upload a result, retrying transient failures with exponential backoff.
@@ -113,39 +173,15 @@ class Worker:
         try:
             while True:
                 try:
-                    resp = await self.client.get(f"{self.relay_url}/poll/{self.role}", params={"worker_id": self.node_id})
+                    params = {"worker_id": self.node_id}
+                    if self.max_batch > 1:
+                        params["max_tasks"] = self.max_batch
+                    resp = await self.client.get(f"{self.relay_url}/poll/{self.role}", params=params)
                     if resp.status_code == 200:
-                        task_data = unpack_payload(resp.content)
-                        if task_data:
-                            task_id = task_data["task_id"]
-                            input_payload = unpack_payload(task_data["payload"])
-                            
-                            print(f"[+] Processing task {task_id}...")
-                            
-                            try:
-                                if asyncio.iscoroutinefunction(func):
-                                    result = await func(input_payload)
-                                else:
-                                    result = await asyncio.to_thread(func, input_payload)
-                                
-                                result_bytes = pack_payload(result)
-                            except Exception as e:
-                                print(f"[!] Task {task_id} failed with error: {e}")
-                                try:
-                                    # In the body: tracebacks do not fit into a URL.
-                                    await self.client.post(
-                                        f"{self.relay_url}/fail/{task_id}",
-                                        params={"worker_id": self.node_id},
-                                        content=f"{type(e).__name__}: {e}".encode("utf-8"),
-                                    )
-                                except Exception as post_err:
-                                    print(f"[!] Failed to report task failure to relay: {post_err}")
-                            else:
-                                params = {"worker_id": self.node_id}
-                                if isinstance(result, dict) and result.get("stop_chain"):
-                                    params["stop_chain"] = "true"
-                                if await self._post_result(task_id, result_bytes, params):
-                                    print(f"[v] Task {task_id} completed.")
+                        data = unpack_payload(resp.content)
+                        items = data["tasks"] if "tasks" in data else [data]
+                        tasks = [(item["task_id"], unpack_payload(item["payload"])) for item in items]
+                        await self._process(func, tasks)
                     elif resp.status_code == 204:
                         pass # No tasks
                     elif resp.status_code == 401:
@@ -180,7 +216,13 @@ class Worker:
                 
             await self.client.aclose()
 
-def worker_node(role: str, relay_url: str = "http://localhost:8000", token: Optional[str] = None):
+def worker_node(
+    role: str,
+    relay_url: str = "http://localhost:8000",
+    token: Optional[str] = None,
+    max_batch: int = 1,
+    batched: bool = False,
+):
     """Decorator to turn a function into a distributed worker."""
     def decorator(func):
         @functools.wraps(func)
@@ -189,7 +231,8 @@ def worker_node(role: str, relay_url: str = "http://localhost:8000", token: Opti
 
         def _worker(node_id: str = None, idle_sleep: float = 0.0) -> Worker:
             return Worker(
-                role=role, relay_url=relay_url, node_id=node_id, idle_sleep=idle_sleep, token=token
+                role=role, relay_url=relay_url, node_id=node_id, idle_sleep=idle_sleep, token=token,
+                max_batch=max_batch, batched=batched,
             )
 
         def start(node_id: str = None, idle_sleep: float = 0.0):
