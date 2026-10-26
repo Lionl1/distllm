@@ -1,4 +1,5 @@
 import asyncio
+import os
 import uuid
 import time
 import httpx
@@ -6,16 +7,33 @@ import functools
 from typing import Callable, Optional
 from .transport import pack_payload, unpack_payload
 
+def _auth_headers(token: Optional[str]) -> dict:
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+class RelayAuthError(PermissionError):
+    """The relay rejected the token (HTTP 401)."""
+
+
 class Worker:
-    def __init__(self, role: str, relay_url: str, node_id: str = None, idle_sleep: float = 0.0):
+    def __init__(
+        self,
+        role: str,
+        relay_url: str,
+        node_id: str = None,
+        idle_sleep: float = 0.0,
+        token: Optional[str] = None,
+    ):
         self.role = role
         self.relay_url = relay_url.rstrip("/")
         self.node_id = node_id or str(uuid.uuid4())[:8]
         # Pause between polls. Not needed: /poll already long-polls on the relay.
         # Kept as a knob to reproduce the old (0.5s) behaviour in benchmarks.
         self.idle_sleep = idle_sleep
+        # Worker token: explicit, else $DISTLLM_WORKER_TOKEN, else $DISTLLM_TOKEN.
+        token = token or os.environ.get("DISTLLM_WORKER_TOKEN") or os.environ.get("DISTLLM_TOKEN")
         # High timeout for unstable tunnels
-        self.client = httpx.AsyncClient(timeout=120.0)
+        self.client = httpx.AsyncClient(timeout=120.0, headers=_auth_headers(token))
 
     async def register(self):
         """Registers the worker node with the relay, retrying if necessary."""
@@ -29,8 +47,12 @@ class Worker:
                 if resp.status_code == 200:
                     print(f"[v] Registration successful.")
                     return
+                if resp.status_code == 401:
+                    raise RelayAuthError("Relay rejected the worker token (set DISTLLM_WORKER_TOKEN or DISTLLM_TOKEN)")
                 else:
                     print(f"[!] Registration failed with status {resp.status_code}. Retrying in 5s...")
+            except RelayAuthError:
+                raise
             except Exception as e:
                 print(f"[!] Registration failed: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
@@ -90,9 +112,13 @@ class Worker:
                                     print(f"[!] Failed to report task failure to relay: {post_err}")
                     elif resp.status_code == 204:
                         pass # No tasks
+                    elif resp.status_code == 401:
+                        raise RelayAuthError("Relay rejected the worker token")
                     else:
                         print(f"[!] Relay returned status {resp.status_code}")
                         await asyncio.sleep(2.0) # Back off on relay errors
+                except RelayAuthError:
+                    raise
                 except Exception as e:
                     print(f"[!] Worker loop error: {e}")
                     await asyncio.sleep(2) # Prevent rapid-fire errors
@@ -118,7 +144,7 @@ class Worker:
                 
             await self.client.aclose()
 
-def worker_node(role: str, relay_url: str = "http://localhost:8000"):
+def worker_node(role: str, relay_url: str = "http://localhost:8000", token: Optional[str] = None):
     """Decorator to turn a function into a distributed worker."""
     def decorator(func):
         @functools.wraps(func)
@@ -126,7 +152,9 @@ def worker_node(role: str, relay_url: str = "http://localhost:8000"):
             return func(*args, **kwargs)
 
         def start(node_id: str = None, idle_sleep: float = 0.0):
-            worker = Worker(role=role, relay_url=relay_url, node_id=node_id, idle_sleep=idle_sleep)
+            worker = Worker(
+                role=role, relay_url=relay_url, node_id=node_id, idle_sleep=idle_sleep, token=token
+            )
             asyncio.run(worker.run(func))
         
         wrapper.start = start
@@ -142,9 +170,10 @@ class Cluster:
     """
     LONG_POLL_WAIT = 30.0
 
-    def __init__(self, relay_url: str, poll_interval: Optional[float] = None):
+    def __init__(self, relay_url: str, poll_interval: Optional[float] = None, token: Optional[str] = None):
         self.relay_url = relay_url.rstrip("/")
-        self.client = httpx.AsyncClient(timeout=120.0)
+        token = token or os.environ.get("DISTLLM_TOKEN")
+        self.client = httpx.AsyncClient(timeout=120.0, headers=_auth_headers(token))
         self.node_id = "client-" + str(uuid.uuid4())[:8]
         self.poll_interval = poll_interval
 
@@ -173,6 +202,8 @@ class Cluster:
             content=data, 
             params=params
         )
+        if resp.status_code == 401:
+            raise RelayAuthError("Relay rejected the client token (set DISTLLM_TOKEN)")
         resp.raise_for_status()
         return resp.json()["task_id"]
 
@@ -187,6 +218,8 @@ class Cluster:
             params = {"wait": min(remaining, self.LONG_POLL_WAIT)} if long_poll else None
             try:
                 resp = await self.client.get(f"{self.relay_url}/get_result/{task_id}", params=params)
+                if resp.status_code == 401:
+                    raise RelayAuthError("Relay rejected the client token (set DISTLLM_TOKEN)")
                 if resp.status_code == 200:
                     if resp.headers.get("content-type") == "application/octet-stream":
                         return unpack_payload(resp.content)
