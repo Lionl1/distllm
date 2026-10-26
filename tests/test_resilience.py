@@ -98,3 +98,16 @@ async def test_generator_recovers_from_lost_task():
     result = await PipelineGenerator(flaky, list(stages)).generate(prompt, 6)
     assert result.token_ids == expected
     assert result.cache_recoveries == 1
+
+
+@pytest.mark.asyncio
+async def test_start_inside_running_loop_points_to_run_async():
+    from distllm import worker_node
+
+    @worker_node(role="nb", relay_url="http://relay")
+    def process(payload):
+        return payload
+
+    with pytest.raises(RuntimeError, match="run_async"):
+        process.start()
+    assert callable(process.run_async)
