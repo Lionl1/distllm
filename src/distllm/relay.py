@@ -84,6 +84,7 @@ class Task:
         payload: bytes,
         route: Optional[List[str]] = None,
         root_id: Optional[str] = None,
+        session: Optional[str] = None,
     ):
         self.task_id = task_id
         self.sender_id = sender_id
@@ -93,6 +94,8 @@ class Task:
         self.route = list(route or [])
         # The task the sender waits on; the final result of the chain lands there.
         self.root_id = root_id or task_id
+        # Tasks of one session go to the same worker of a role (it holds the KV cache).
+        self.session = session or None
         self.status = "PENDING" # PENDING, ASSIGNED, FORWARDED, COMPLETED, FAILED
         self.worker_id = None
         self.assigned_at = None
@@ -114,6 +117,12 @@ class Node:
 nodes: Dict[str, Node] = {}
 tasks: Dict[str, Task] = {}
 pending_queues: Dict[str, asyncio.Queue] = {} # role -> Queue
+# Session affinity: several workers may serve one role (replicas), but a session's KV
+# cache lives on one of them. (role, session) -> (worker_id, last used); tasks of a bound
+# session go to that worker's own queue while it is alive.
+worker_queues: Dict[str, asyncio.Queue] = {} # worker_id -> Queue
+affinity: Dict[tuple, tuple] = {}
+SESSION_AFFINITY_TTL = 900.0
 
 TASK_TIMEOUT = 30.0 # Seconds before a task is returned to queue
 NODE_TIMEOUT = 30.0 # Seconds before a node is considered dead (3x heartbeat interval)
@@ -126,18 +135,74 @@ STOP_CHAIN_SNIFF_LIMIT = 4096  # bytes; hidden-state payloads are never decoded 
 MAX_ERROR_LENGTH = 8000
 
 # --- Background Tasks ---
+def _role_queue(role: str) -> asyncio.Queue:
+    if role not in pending_queues:
+        pending_queues[role] = asyncio.Queue()
+    return pending_queues[role]
+
+
+def _worker_queue(worker_id: str) -> asyncio.Queue:
+    if worker_id not in worker_queues:
+        worker_queues[worker_id] = asyncio.Queue()
+    return worker_queues[worker_id]
+
+
+def _bound_worker(task: Task) -> Optional[str]:
+    """The live worker holding this task's session for its role, if any."""
+    if not task.session:
+        return None
+    entry = affinity.get((task.target_role, task.session))
+    if entry is None:
+        return None
+    worker_id = entry[0]
+    node = nodes.get(worker_id)
+    if node is None or node.role != task.target_role:
+        affinity.pop((task.target_role, task.session), None)
+        return None
+    return worker_id
+
+
+async def _enqueue(task: Task) -> None:
+    tasks[task.task_id] = task
+    worker_id = _bound_worker(task)
+    queue = _worker_queue(worker_id) if worker_id else _role_queue(task.target_role)
+    await queue.put(task.task_id)
+
+
+async def _requeue(task: Task, reason: str) -> None:
+    """Return an assigned task to its role queue (any replica may take it)."""
+    print(f"Task {task.task_id} {reason}. Re-queuing...")
+    if task.session:
+        # The bound worker is dead or too slow: let another replica take the session.
+        entry = affinity.get((task.target_role, task.session))
+        if entry and entry[0] == task.worker_id:
+            del affinity[(task.target_role, task.session)]
+    task.status = "PENDING"
+    task.worker_id = None
+    task.assigned_at = None
+    await _role_queue(task.target_role).put(task.task_id)
+
+
+async def _forget_worker(worker_id: str) -> None:
+    """Re-queue everything a gone worker held or had queued, drop its sessions."""
+    for task in list(tasks.values()):
+        if task.status == "ASSIGNED" and task.worker_id == worker_id:
+            await _requeue(task, f"was assigned to gone node {worker_id}")
+    queue = worker_queues.pop(worker_id, None)
+    while queue is not None and not queue.empty():
+        task = tasks.get(queue.get_nowait())
+        if task is not None and task.status == "PENDING":
+            await _role_queue(task.target_role).put(task.task_id)
+    for key in [k for k, (w, _) in affinity.items() if w == worker_id]:
+        del affinity[key]
+
+
 async def cleanup_stuck_tasks():
     """Recover stuck tasks."""
     now = time.time()
     for tid, task in list(tasks.items()):
         if task.status == "ASSIGNED" and task.assigned_at and (now - task.assigned_at > TASK_TIMEOUT):
-            print(f"Task {tid} timed out on worker {task.worker_id}. Re-queuing...")
-            task.status = "PENDING"
-            task.worker_id = None
-            task.assigned_at = None
-            if task.target_role not in pending_queues:
-                pending_queues[task.target_role] = asyncio.Queue()
-            await pending_queues[task.target_role].put(tid)
+            await _requeue(task, f"timed out on worker {task.worker_id}")
 
 def cleanup_old_tasks():
     """Remove old tasks to prevent memory leaks."""
@@ -157,6 +222,8 @@ def cleanup_old_tasks():
             del tasks[tid]
         except KeyError:
             pass
+    for key in [k for k, (_, used) in affinity.items() if now - used > SESSION_AFFINITY_TTL]:
+        del affinity[key]
 
 async def relay_janitor():
     """Cleans up dead nodes, recovers stuck tasks, and prevents memory leaks."""
@@ -168,18 +235,8 @@ async def relay_janitor():
         for nid in dead_node_ids:
             if nid in nodes:
                 print(f"Node {nid} ({nodes[nid].role}) timed out.")
-                role = nodes[nid].role
                 del nodes[nid]
-                # Immediately re-queue tasks assigned to the dead worker
-                for tid, task in list(tasks.items()):
-                    if task.status == "ASSIGNED" and task.worker_id == nid:
-                        print(f"Task {tid} was assigned to dead node {nid}. Re-queuing immediately...")
-                        task.status = "PENDING"
-                        task.worker_id = None
-                        task.assigned_at = None
-                        if task.target_role not in pending_queues:
-                            pending_queues[task.target_role] = asyncio.Queue()
-                        await pending_queues[task.target_role].put(tid)
+                await _forget_worker(nid)
 
         # 2. Recover Stuck Tasks
         await cleanup_stuck_tasks()
@@ -194,25 +251,16 @@ async def relay_janitor():
 @app.post("/register")
 async def register(node_id: str, role: str):
     nodes[node_id] = Node(node_id, role)
-    if role not in pending_queues:
-        pending_queues[role] = asyncio.Queue()
+    _role_queue(role)
+    _worker_queue(node_id)
     return {"status": "ok"}
 
 @app.post("/deregister")
 async def deregister(node_id: str):
     if node_id in nodes:
         print(f"Node {node_id} ({nodes[node_id].role}) deregistered gracefully.")
-        # Immediately re-queue tasks assigned to this worker
-        for tid, task in list(tasks.items()):
-            if task.status == "ASSIGNED" and task.worker_id == node_id:
-                print(f"Task {tid} was assigned to deregistered node {node_id}. Re-queuing immediately...")
-                task.status = "PENDING"
-                task.worker_id = None
-                task.assigned_at = None
-                if task.target_role not in pending_queues:
-                    pending_queues[task.target_role] = asyncio.Queue()
-                await pending_queues[task.target_role].put(tid)
         del nodes[node_id]
+        await _forget_worker(node_id)
     return {"status": "ok"}
 
 @app.post("/heartbeat")
@@ -222,50 +270,60 @@ async def heartbeat(node_id: str):
         return {"status": "ok"}
     raise HTTPException(status_code=404)
 
-async def _enqueue(task: Task) -> None:
-    tasks[task.task_id] = task
-    if task.target_role not in pending_queues:
-        pending_queues[task.target_role] = asyncio.Queue()
-    await pending_queues[task.target_role].put(task.task_id)
-
 
 @app.post("/submit")
-async def submit_task(request: Request, target_role: str, sender_id: str, route: str = ""):
+async def submit_task(request: Request, target_role: str, sender_id: str, route: str = "", session: str = ""):
     """Submits a task to be processed by a specific role.
 
     ``route`` (comma-separated roles) chains the task: the result of each step is
     sent by the relay straight to the next role, and the sender gets only the final
     result — one client round trip per chain instead of one per stage.
+    ``session`` pins the tasks of one session to the worker of each role that first
+    took it (the one holding its KV cache), as long as that worker is alive.
     """
     body = await request.body()
     task_id = str(uuid.uuid4())
     next_roles = [r for r in (x.strip() for x in route.split(",")) if r]
-    await _enqueue(Task(task_id, sender_id, target_role, body, route=next_roles))
+    await _enqueue(Task(task_id, sender_id, target_role, body, route=next_roles, session=session))
     return {"task_id": task_id}
 
-async def _queue_get(queue: asyncio.Queue, timeout: float) -> Optional[str]:
-    """queue.get() with a timeout that never loses an item.
+async def _queue_get_first(queues: List[asyncio.Queue], timeout: float) -> Optional[str]:
+    """Get an item from the first of ``queues`` that has one, waiting up to ``timeout``.
 
-    asyncio.wait_for(queue.get(), t) may discard an item dequeued right as the
-    timeout fires (Python < 3.12); that task would stay PENDING outside any queue.
+    Never loses an item: asyncio.wait_for(queue.get(), t) may discard one dequeued right
+    as the timeout fires (Python < 3.12); items taken by getters that lost the race (or
+    when the request itself is cancelled) are put back.
     """
-    getter = asyncio.ensure_future(queue.get())
+    for queue in queues:
+        if not queue.empty():
+            return queue.get_nowait()
+    getters = [asyncio.ensure_future(queue.get()) for queue in queues]
+    cancelled = False
     try:
-        done, _ = await asyncio.wait({getter}, timeout=timeout)
+        await asyncio.wait(getters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
     except asyncio.CancelledError:
-        # The request itself was cancelled (shutdown/disconnect): give the item back.
+        cancelled = True
+    for getter in getters:
         getter.cancel()
-        if getter.done() and not getter.cancelled():
-            queue.put_nowait(getter.result())
-        raise
-    if not done:
-        getter.cancel()
-        try:
-            await getter
-        except asyncio.CancelledError:
-            return None
-    # The getter may have completed during cancellation: keep its item.
-    return getter.result()
+    await asyncio.gather(*getters, return_exceptions=True)
+    got = [
+        (queue, getter.result())
+        for queue, getter in zip(queues, getters)
+        if getter.done() and not getter.cancelled() and getter.exception() is None
+    ]
+    if cancelled:
+        for queue, item in got:
+            queue.put_nowait(item)
+        raise asyncio.CancelledError
+    if not got:
+        return None
+    for queue, item in got[1:]:
+        queue.put_nowait(item)
+    return got[0][1]
+
+
+async def _queue_get(queue: asyncio.Queue, timeout: float) -> Optional[str]:
+    return await _queue_get_first([queue], timeout)
 
 
 @app.get("/poll/{role}")
@@ -273,11 +331,11 @@ async def poll_task(role: str, worker_id: str):
     """Workers call this to fetch a pending task."""
     # Создаём очередь, если её нет (например, relay перезапустился), и ждём в ней:
     # мгновенный 204 заставлял бы воркер крутиться в цикле запросов.
-    if role not in pending_queues:
-        pending_queues[role] = asyncio.Queue()
+    own_queue = _worker_queue(worker_id)
+    role_queue = _role_queue(role)
 
-    # Wait up to 5s for a task (long polling)
-    task_id = await _queue_get(pending_queues[role], timeout=5.0)
+    # Wait up to 5s for a task (long polling): this worker's sessions first.
+    task_id = await _queue_get_first([own_queue, role_queue], timeout=5.0)
     if task_id is None:
         return Response(status_code=204)
     task = tasks.get(task_id)
@@ -291,6 +349,8 @@ async def poll_task(role: str, worker_id: str):
     task.status = "ASSIGNED"
     task.worker_id = worker_id
     task.assigned_at = time.time()
+    if task.session:
+        affinity[(task.target_role, task.session)] = (worker_id, task.assigned_at)
 
     # We need to return the task_id AND the payload.
     # Since we want to avoid JSON encoding binary data, 
@@ -360,7 +420,7 @@ async def post_result(
             task.done.set()  # nobody waits on an intermediate step
         await _enqueue(Task(
             str(uuid.uuid4()), task.sender_id, task.route[0], body,
-            route=task.route[1:], root_id=task.root_id,
+            route=task.route[1:], root_id=task.root_id, session=task.session,
         ))
         return {"status": "forwarded"}
 

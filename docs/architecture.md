@@ -51,6 +51,19 @@ PENDING ──poll──► ASSIGNED ──result──► COMPLETED
 - `/poll` never loses a dequeued task id on timeout or cancellation (a known
   `asyncio.wait_for(queue.get())` race on Python < 3.12).
 
+### Session affinity (replicas)
+
+Several workers may serve one role. Tasks submitted with `?session=` (`Cluster.submit` sets
+it from the payload's `session_id`) are pinned to the worker of each role that first took
+the session — the one holding its KV cache:
+
+- each worker has its own queue besides the role queue; `/poll` serves its own queue first;
+- the binding is set on assignment, follows the session through routes, and expires after
+  15 idle minutes;
+- when the bound worker deregisters, dies or times out on a task, its queued and assigned
+  tasks go back to the role queue and the session is re-bound to whichever replica takes it
+  next (that replica answers `cache_miss`, the client replays once).
+
 ### Routes (chained stages)
 
 `/submit?route=stage-1,stage-2` makes the relay forward each step's result as the payload

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Session affinity for replicas: tasks of a session go to the worker of each role that
+  holds its KV cache (`?session=`, set by `Cluster` from `session_id`); re-bound when that
+  worker is gone.
 - Sampling: `SamplingParams(temperature, top_k, top_p, seed)` for `PipelineGenerator`;
   client flags `--temperature --top-k --top-p --seed`.
 - `docs/self-hosted.md`: running on your own machines with friends (relay placement,

@@ -361,3 +361,71 @@ def test_assigned_task_requires_worker_id():
     assert client.post(f"/result/{task_id}", content=pack_payload({"y": "forged"})).status_code == 409
     assert client.post(f"/fail/{task_id}", content=b"forged").status_code == 409
     assert client.post(f"/result/{task_id}", content=pack_payload({"y": 1}), params={"worker_id": "owner"}).status_code == 200
+
+
+# --- session affinity (replicas of a role) ---
+
+def _submit(role, session=""):
+    params = {"target_role": role, "sender_id": "c"}
+    if session:
+        params["session"] = session
+    return client.post("/submit", content=pack_payload({"session_id": session}), params=params).json()["task_id"]
+
+
+def test_session_sticks_to_the_worker_that_took_it():
+    from distllm.relay import worker_queues
+
+    for w in ("rep-a", "rep-b"):
+        client.post("/register", params={"node_id": w, "role": "rep"})
+    first = _submit("rep", "sess-1")
+    assert _poll("rep", worker_id="rep-a")["task_id"] == first
+    client.post(f"/result/{first}", content=pack_payload({}), params={"worker_id": "rep-a"})
+
+    second = _submit("rep", "sess-1")
+    # Задача сессии ждёт в личной очереди rep-a, а не в общей очереди роли.
+    assert list(worker_queues["rep-a"]._queue) == [second]
+    assert _poll("rep", worker_id="rep-a")["task_id"] == second
+
+
+def test_session_moves_to_another_replica_when_its_worker_leaves():
+    from distllm.relay import affinity
+
+    for w in ("mv-a", "mv-b"):
+        client.post("/register", params={"node_id": w, "role": "mv"})
+    first = _submit("mv", "sess-2")
+    _poll("mv", worker_id="mv-a")
+    client.post(f"/result/{first}", content=pack_payload({}), params={"worker_id": "mv-a"})
+    queued = _submit("mv", "sess-2")  # лежит в очереди mv-a
+
+    client.post("/deregister", params={"node_id": "mv-a"})
+
+    assert _poll("mv", worker_id="mv-b")["task_id"] == queued
+    assert affinity[("mv", "sess-2")][0] == "mv-b"
+
+
+def test_tasks_without_session_use_the_role_queue():
+    from distllm.relay import worker_queues
+
+    client.post("/register", params={"node_id": "plain-a", "role": "plain"})
+    task_id = _submit("plain")
+    assert task_id not in list(worker_queues.get("plain-a", asyncio.Queue())._queue)
+    assert _poll("plain", worker_id="plain-a")["task_id"] == task_id
+
+
+@pytest.mark.asyncio
+async def test_queue_get_first_prefers_first_queue_and_keeps_the_rest():
+    from distllm.relay import _queue_get_first
+
+    own, shared = asyncio.Queue(), asyncio.Queue()
+    shared.put_nowait("shared-1")
+    own.put_nowait("own-1")
+    assert await _queue_get_first([own, shared], timeout=0) == "own-1"
+    assert await _queue_get_first([own, shared], timeout=0) == "shared-1"
+    assert await _queue_get_first([own, shared], timeout=0.01) is None
+
+    async def later():
+        await asyncio.sleep(0.05)
+        shared.put_nowait("late")
+
+    asyncio.create_task(later())
+    assert await _queue_get_first([own, shared], timeout=1) == "late"
