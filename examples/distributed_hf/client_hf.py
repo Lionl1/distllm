@@ -6,12 +6,12 @@ import asyncio
 from transformers import AutoTokenizer
 
 from distllm import Cluster
-from distllm.hf import PipelineGenerator, SamplingParams, SpeculativeGenerator
+from distllm.hf import AuditConfig, PipelineGenerator, SamplingParams, SpeculativeGenerator
 
 
 async def generate(
     prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None,
-    route=False, draft_model_id=None, speculative_k=4, relay_token=None, sampling=None,
+    route=False, draft_model_id=None, speculative_k=4, relay_token=None, sampling=None, audit=None,
 ):
     print("[*] Initializing Thin Client (Tokenizer only)...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
@@ -23,6 +23,8 @@ async def generate(
     async with Cluster(relay_url, token=relay_token) as cluster:
         route_call = cluster.call_route if route else None
         sampling = sampling or SamplingParams()
+        if draft_model_id and audit is not None:
+            raise SystemExit("auditing is available for regular generation: drop --draft-model-id or --audit-roles")
         if draft_model_id and not sampling.greedy:
             raise SystemExit("speculative decoding is greedy-only: drop --temperature or --draft-model-id")
         if draft_model_id:
@@ -34,7 +36,7 @@ async def generate(
                 cluster.call, worker_roles, draft, k=speculative_k, route_call=route_call
             )
         else:
-            generator = PipelineGenerator(cluster.call, worker_roles, route_call=route_call)
+            generator = PipelineGenerator(cluster.call, worker_roles, route_call=route_call, audit=audit)
         extra = {} if draft_model_id else {"sampling": sampling}
         result = await generator.generate(
             input_ids,
@@ -48,6 +50,7 @@ async def generate(
     print(
         f"[i] prefill {result.prefill_seconds * 1000:.0f} ms, "
         f"{result.tokens_per_second:.2f} tokens/s, cache recoveries: {result.cache_recoveries}"
+        + (f", audits passed: {result.audits}" if audit is not None else "")
     )
     if hasattr(result, "acceptance_rate"):
         print(f"[i] draft acceptance {result.acceptance_rate:.0%}, {result.tokens_per_round:.2f} tokens per round")
@@ -71,6 +74,9 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--audit-roles", type=str, default=None,
+                        help="auditor stage roles mirroring --workers (trusted machines), comma-separated")
+    parser.add_argument("--audit-rate", type=float, default=0.05, help="share of tokens to spot-check")
     args = parser.parse_args()
 
     worker_roles = [w.strip() for w in args.workers.split(",")]
@@ -79,4 +85,6 @@ if __name__ == "__main__":
         route=args.route, draft_model_id=args.draft_model_id, speculative_k=args.speculative_k,
         relay_token=args.relay_token,
         sampling=SamplingParams(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, seed=args.seed),
+        audit=AuditConfig(roles=[r.strip() for r in args.audit_roles.split(",")], rate=args.audit_rate)
+        if args.audit_roles else None,
     ))

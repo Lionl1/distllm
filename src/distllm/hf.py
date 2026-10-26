@@ -517,6 +517,7 @@ class GenerationResult:
     prefill_seconds: float
     token_seconds: list[float]
     cache_recoveries: int
+    audits: int = 0  # spot checks against the auditor stages that passed
 
     @property
     def tokens_per_second(self) -> float:
@@ -526,6 +527,44 @@ class GenerationResult:
 
 class CacheRecoveryError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class AuditConfig:
+    """Spot-check the pipeline against an independent set of stages.
+
+    ``roles`` are auditor stages with the same layer ranges as the main roles, run by
+    machines you trust (e.g. your own). With probability ``rate`` per generated token,
+    the client re-computes the current prefix through the auditors from scratch and
+    compares the last-position logits with the main pipeline's (cosine similarity
+    >= ``min_similarity``; different hardware/dtypes stay well above 0.99, garbage does
+    not). On a mismatch with ``locate=True`` every main stage is swapped into the auditor
+    chain one at a time to find which one computes differently.
+    """
+
+    roles: list
+    rate: float = 0.05
+    min_similarity: float = 0.99
+    locate: bool = True
+    seed: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.rate <= 1:
+            raise ValueError("rate must be in [0, 1]")
+
+
+class VerificationError(RuntimeError):
+    """The pipeline's output disagrees with the auditor stages."""
+
+    def __init__(self, message: str, suspects: list, similarity: float) -> None:
+        super().__init__(message)
+        self.suspects = suspects
+        self.similarity = similarity
+
+
+def _similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    a, b = a.reshape(-1).float(), b.reshape(-1).float()
+    return float(torch.nn.functional.cosine_similarity(a, b, dim=0))
 
 
 class PipelineGenerator:
@@ -546,14 +585,61 @@ class PipelineGenerator:
         route_call: Optional[RouteCallFn] = None,
         use_kv_cache: bool = True,
         max_recoveries_per_step: int = 2,
+        audit: Optional[AuditConfig] = None,
     ) -> None:
         if not roles:
             raise ValueError("at least one stage role is required")
+        if audit is not None and len(audit.roles) != len(roles):
+            raise ValueError("audit.roles must mirror roles one to one (same layer ranges)")
         self.call = call
         self.route_call = route_call
         self.roles = list(roles)
         self.use_kv_cache = use_kv_cache
         self.max_recoveries_per_step = max_recoveries_per_step
+        self.audit = audit
+        self._audit_rng = torch.Generator().manual_seed(audit.seed if audit and audit.seed is not None else 0)
+        if audit is not None and audit.seed is None:
+            self._audit_rng.seed()
+
+    async def _run_fresh(self, chain: list, sequence: torch.Tensor) -> torch.Tensor:
+        """Last-position logits of ``sequence`` through ``chain``, in a throwaway session."""
+        session_id = "audit-" + uuid.uuid4().hex
+        payload: dict = {"session_id": session_id, "start_pos": 0, "input_ids": sequence}
+        try:
+            for role in chain:
+                response = await self.call(role, payload)
+                if "logits" in response:
+                    return response["logits"]
+                if response.get("cache_miss") or "hidden_states" not in response:
+                    raise RuntimeError(f"audit chain broke at {role}: {sorted(response)}")
+                payload = {"session_id": session_id, "start_pos": 0, "hidden_states": response["hidden_states"]}
+            raise RuntimeError("audit chain did not end with logits")
+        finally:
+            for role in set(chain):
+                try:
+                    await self.call(role, {"session_id": session_id, "close": True})
+                except Exception:  # noqa: BLE001 — best effort
+                    pass
+
+    async def _check(self, sequence: torch.Tensor, logits: torch.Tensor) -> None:
+        audit = self.audit
+        reference = await self._run_fresh(audit.roles, sequence)
+        similarity = _similarity(logits, reference)
+        if similarity >= audit.min_similarity:
+            return
+        suspects: list = []
+        if audit.locate:
+            for i, role in enumerate(self.roles):
+                mixed = list(audit.roles)
+                mixed[i] = role
+                if _similarity(await self._run_fresh(mixed, sequence), reference) < audit.min_similarity:
+                    suspects.append(role)
+        raise VerificationError(
+            f"pipeline output disagrees with the auditors (similarity {similarity:.4f} < "
+            f"{audit.min_similarity}); suspected stages: {suspects or 'unknown'}",
+            suspects,
+            similarity,
+        )
 
     async def _forward(self, session_id: str, start_pos: int, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
         """Run new tokens through all stages; return last-token logits or None on cache miss."""
@@ -602,6 +688,7 @@ class PipelineGenerator:
         eos = {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])
         sampling = sampling or SamplingParams()
         rng = sampling.generator()
+        audits = 0
 
         session_id = uuid.uuid4().hex
         sequence = input_ids.clone()
@@ -632,6 +719,9 @@ class PipelineGenerator:
                         raise RuntimeError("unexpected cache miss with start_pos=0")
 
                 cached = sequence.shape[1]
+                if self.audit is not None and float(torch.rand((), generator=self._audit_rng)) < self.audit.rate:
+                    await self._check(sequence, logits)
+                    audits += 1
                 next_id = sample_next(logits[0], sampling, rng)
                 elapsed = time.perf_counter() - started
                 if step == 0:
@@ -653,6 +743,7 @@ class PipelineGenerator:
             prefill_seconds=prefill_seconds,
             token_seconds=token_seconds,
             cache_recoveries=recoveries,
+            audits=audits,
         )
 
     async def _close(self, session_id: str) -> None:
