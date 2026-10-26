@@ -21,6 +21,11 @@ src/distllm/
 
 ## Relay
 
+Two interchangeable implementations of the same protocol: `distllm.relay` (Python, FastAPI)
+and `relay-rs/` (Rust, axum + tokio; one binary, ~2× lower per-hop latency, a few MB of RAM).
+`tests/test_relay_http.py` runs the same HTTP conformance suite against both, and the
+integration tests run against either (`DISTLLM_TEST_RELAY=rust`).
+
 ### Endpoints
 
 | endpoint | side | purpose |

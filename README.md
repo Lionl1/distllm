@@ -53,6 +53,8 @@ uv sync                     # add --extra quantization for nf4/int8 stages
 
 export DISTLLM_TOKEN=$(openssl rand -hex 24)
 uv run distllm relay --port 8000
+# or the Rust relay — same protocol, ~2× lower per-hop latency, 4 MB of RAM, one binary:
+# (cd relay-rs && cargo build --release) && relay-rs/target/release/distllm-relay --port 8000
 ```
 
 On any machines that can reach the relay — your PCs, friends' computers, a VPS, or Colab
@@ -141,6 +143,7 @@ computes differently.
   splitting layers (`examples/plan_split.py`), privacy and trust.
 - [Running on Google Colab](docs/colab.md) — relay behind a tunnel, workers in notebooks.
 - [Benchmarks](docs/benchmarks.md) — methodology, all results, how to reproduce.
+- [Rust relay](relay-rs/README.md) — drop-in replacement for the Python relay.
 - [Changelog](CHANGELOG.md)
 
 ## Limitations

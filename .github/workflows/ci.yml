@@ -28,3 +28,30 @@ jobs:
         run: uv sync --extra test --extra quantization
       - name: Test
         run: uv run pytest -q
+
+  rust-relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: relay-rs
+      - name: Build, lint, unit tests
+        working-directory: relay-rs
+        run: |
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+          cargo test --release
+          cargo build --release
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Conformance and integration tests against the Rust relay
+        run: |
+          uv sync --extra test
+          uv run pytest -q tests/test_relay_http.py
+          DISTLLM_TEST_RELAY=rust uv run pytest -q tests/test_integration.py

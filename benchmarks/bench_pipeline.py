@@ -168,6 +168,7 @@ def main() -> None:
     parser.add_argument("--worker-rtt-ms", type=float, default=0.0)
     parser.add_argument("--client-rtt-ms", type=float, default=0.0)
     parser.add_argument("--modes", default="distllm,no-kv-cache,legacy")
+    parser.add_argument("--relay-bin", default=None, help="use the Rust relay binary instead of the Python relay")
     parser.add_argument("--output", default=str(Path(__file__).with_name("results.md")))
     args = parser.parse_args()
 
@@ -199,7 +200,19 @@ def main() -> None:
     for key, mode in modes.items():
         port = _free_port()
         relay_url = f"http://127.0.0.1:{port}"
-        procs = [ctx.Process(target=_run_relay, args=(port, args.worker_rtt_ms, args.client_rtt_ms), daemon=True)]
+        relay_proc = None
+        if args.relay_bin:
+            import subprocess
+
+            relay_proc = subprocess.Popen(
+                [args.relay_bin, "--port", str(port), "--host", "127.0.0.1",
+                 "--simulate-worker-rtt-ms", str(args.worker_rtt_ms),
+                 "--simulate-client-rtt-ms", str(args.client_rtt_ms)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            procs = []
+        else:
+            procs = [ctx.Process(target=_run_relay, args=(port, args.worker_rtt_ms, args.client_rtt_ms), daemon=True)]
         for role, (a, b) in zip(roles, splits):
             procs.append(ctx.Process(
                 target=_run_stage_worker,
@@ -217,6 +230,9 @@ def main() -> None:
                 p.terminate()
             for p in procs:
                 p.join(timeout=10)
+            if relay_proc is not None:
+                relay_proc.terminate()
+                relay_proc.wait(timeout=10)
         extra = ""
         if hasattr(result, "acceptance_rate"):
             extra = f"acceptance {result.acceptance_rate:.0%}, {result.tokens_per_round:.1f} tokens/round"
@@ -239,7 +255,7 @@ def main() -> None:
         + (f"; draft: `{args.draft_model_id}`" if draft is not None else ""),
         f"- stages: {len(splits)} ({', '.join(f'{a}-{b}' for a, b in splits)}), relay and workers are "
         f"separate processes on one machine ({platform.processor() or platform.machine()}, {platform.system()})",
-        f"- network: {network}",
+        f"- network: {network}; relay: {'Rust (' + args.relay_bin + ')' if args.relay_bin else 'Python'}",
         f"- prompt: {prompt_len} tokens, generated: {args.new_tokens} tokens, greedy",
         "",
         "| mode | prefill, ms | per token, ms (median) | tokens/s | same tokens as full model | notes |",
