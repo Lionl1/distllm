@@ -187,13 +187,27 @@ def worker_node(role: str, relay_url: str = "http://localhost:8000", token: Opti
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
-        def start(node_id: str = None, idle_sleep: float = 0.0):
-            worker = Worker(
+        def _worker(node_id: str = None, idle_sleep: float = 0.0) -> Worker:
+            return Worker(
                 role=role, relay_url=relay_url, node_id=node_id, idle_sleep=idle_sleep, token=token
             )
-            asyncio.run(worker.run(func))
-        
+
+        def start(node_id: str = None, idle_sleep: float = 0.0):
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(_worker(node_id, idle_sleep).run(func))
+                return
+            raise RuntimeError(
+                "An event loop is already running (Jupyter/Colab): use `await process.run_async()` instead of start()"
+            )
+
+        async def run_async(node_id: str = None, idle_sleep: float = 0.0):
+            """Run the worker inside an existing event loop (e.g. `await` in a notebook cell)."""
+            await _worker(node_id, idle_sleep).run(func)
+
         wrapper.start = start
+        wrapper.run_async = run_async
         return wrapper
     return decorator
 
