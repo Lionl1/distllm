@@ -137,3 +137,60 @@ def test_deregistration():
     # Verify the task is PENDING again immediately
     resp = client.get(f"/get_result/{task_id}")
     assert resp.json()["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_get_result_long_poll_returns_as_soon_as_done():
+    import httpx
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://relay") as ac:
+        submit = await ac.post(
+            "/submit", content=pack_payload({"x": 1}),
+            params={"target_role": "lp", "sender_id": "c"},
+        )
+        task_id = submit.json()["task_id"]
+
+        async def finish_later():
+            await asyncio.sleep(0.3)
+            await ac.post(f"/result/{task_id}", content=pack_payload({"y": 2}))
+
+        started = time.monotonic()
+        finisher = asyncio.create_task(finish_later())
+        resp = await ac.get(f"/get_result/{task_id}", params={"wait": 10})
+        elapsed = time.monotonic() - started
+        await finisher
+
+        assert resp.headers["content-type"] == "application/octet-stream"
+        assert unpack_payload(resp.content) == {"y": 2}
+        # Ответ пришёл сразу после результата, а не по истечении wait.
+        assert 0.25 < elapsed < 2.0
+
+
+@pytest.mark.asyncio
+async def test_get_result_long_poll_times_out_with_status():
+    import httpx
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://relay") as ac:
+        submit = await ac.post(
+            "/submit", content=pack_payload({"x": 1}),
+            params={"target_role": "lp-timeout", "sender_id": "c"},
+        )
+        task_id = submit.json()["task_id"]
+        resp = await ac.get(f"/get_result/{task_id}", params={"wait": 0.2})
+        assert resp.json() == {"status": "PENDING"}
+
+
+def test_first_result_wins():
+    submit = client.post(
+        "/submit", content=pack_payload({"x": 1}),
+        params={"target_role": "dup", "sender_id": "c"},
+    )
+    task_id = submit.json()["task_id"]
+
+    assert client.post(f"/result/{task_id}", content=pack_payload({"y": "first"})).json() == {"status": "ok"}
+    # Дубликат после переотдачи задачи не перезаписывает результат.
+    assert client.post(f"/result/{task_id}", content=pack_payload({"y": "late"})).json() == {"status": "ignored"}
+    assert client.post(f"/fail/{task_id}", params={"error_msg": "late"}).json() == {"status": "ignored"}
+    assert unpack_payload(client.get(f"/get_result/{task_id}").content) == {"y": "first"}

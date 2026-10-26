@@ -30,6 +30,8 @@ class Task:
         self.result = None
         self.created_at = time.time()
         self.completed_at = None
+        # Set when the task reaches COMPLETED/FAILED; long-polling clients wait on it.
+        self.done = asyncio.Event()
 
 # --- Registry State ---
 class Node:
@@ -44,6 +46,7 @@ pending_queues: Dict[str, asyncio.Queue] = {} # role -> Queue
 
 TASK_TIMEOUT = 30.0 # Seconds before a task is returned to queue
 NODE_TIMEOUT = 30.0 # Seconds before a node is considered dead (3x heartbeat interval)
+MAX_RESULT_WAIT = 60.0 # Upper bound for long-poll in /get_result
 
 # --- Background Tasks ---
 async def cleanup_stuck_tasks():
@@ -158,9 +161,11 @@ async def submit_task(request: Request, target_role: str, sender_id: str):
 @app.get("/poll/{role}")
 async def poll_task(role: str, worker_id: str):
     """Workers call this to fetch a pending task."""
+    # Создаём очередь, если её нет (например, relay перезапустился), и ждём в ней:
+    # мгновенный 204 заставлял бы воркер крутиться в цикле запросов.
     if role not in pending_queues:
-        return Response(status_code=204)
-    
+        pending_queues[role] = asyncio.Queue()
+
     try:
         # Wait up to 5s for a task (long polling)
         task_id = await asyncio.wait_for(pending_queues[role].get(), timeout=5.0)
@@ -194,9 +199,14 @@ async def post_result(task_id: str, request: Request):
         raise HTTPException(status_code=404)
     
     task = tasks[task_id]
-    task.result = await request.body()
+    body = await request.body()
+    # Задача могла быть переотдана другому воркеру после таймаута: первый результат побеждает.
+    if task.status in ("COMPLETED", "FAILED"):
+        return {"status": "ignored"}
+    task.result = body
     task.status = "COMPLETED"
     task.completed_at = time.time()
+    task.done.set()
     return {"status": "ok"}
 
 @app.post("/fail/{task_id}")
@@ -206,18 +216,32 @@ async def post_failure(task_id: str, error_msg: str):
         raise HTTPException(status_code=404)
     
     task = tasks[task_id]
+    if task.status in ("COMPLETED", "FAILED"):
+        return {"status": "ignored"}
     task.status = "FAILED"
     task.result = error_msg.encode("utf-8")
     task.completed_at = time.time()
+    task.done.set()
     return {"status": "ok"}
 
 @app.get("/get_result/{task_id}")
-async def get_result(task_id: str):
-    """Senders call this to fetch the result of a task."""
+async def get_result(task_id: str, wait: float = 0.0):
+    """Senders call this to fetch the result of a task.
+
+    With ``wait > 0`` the request is held (long-poll) until the task finishes or
+    ``wait`` seconds pass, so the result is returned as soon as it is ready.
+    """
     if task_id not in tasks:
         raise HTTPException(status_code=404)
-    
+
     task = tasks[task_id]
+    if wait > 0 and not task.done.is_set():
+        try:
+            await asyncio.wait_for(task.done.wait(), timeout=min(wait, MAX_RESULT_WAIT))
+        except asyncio.TimeoutError:
+            pass
+        if task_id not in tasks:
+            raise HTTPException(status_code=404)
     if task.status == "COMPLETED":
         return Response(content=task.result, media_type="application/octet-stream")
     if task.status == "FAILED":
