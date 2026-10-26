@@ -12,9 +12,10 @@ from distllm.hf import AuditConfig, PipelineGenerator, SamplingParams, Speculati
 async def generate(
     prompt, model_id, relay_url, worker_roles, max_new_tokens=50, token=None,
     route=False, draft_model_id=None, speculative_k=4, relay_token=None, sampling=None, audit=None,
+    revision=None,
 ):
     print("[*] Initializing Thin Client (Tokenizer only)...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=token, revision=revision)
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids
 
     print(f"[*] Prompt: {prompt}")
@@ -66,6 +67,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=50)
     parser.add_argument("--token", type=str, default=None, help="Hugging Face token")
     parser.add_argument("--relay-token", type=str, default=None, help="relay client token (default: $DISTLLM_TOKEN)")
+    parser.add_argument("--revision", type=str, default=None, help="model commit the stages use (tokenizer)")
     parser.add_argument("--route", action="store_true", help="chain stages relay-side (one request per step)")
     parser.add_argument("--draft-model-id", type=str, default=None,
                         help="small model with the same tokenizer for speculative decoding")
@@ -87,4 +89,5 @@ if __name__ == "__main__":
         sampling=SamplingParams(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, seed=args.seed),
         audit=AuditConfig(roles=[r.strip() for r in args.audit_roles.split(",")], rate=args.audit_rate)
         if args.audit_roles else None,
+        revision=args.revision,
     ))

@@ -75,6 +75,13 @@ me         stage-3    46..47         1.9 /        6.0
 …followed by the exact command for every machine and for the client. The estimate covers
 weights plus a KV cache for one `--context`-token session and keeps 15% headroom.
 
+**Everybody must load the same model version.** Each machine downloads its own slice of the
+weights; if the Hub repository is updated between two downloads, the slices come from
+different models and the output is garbage. `plan_split.py` therefore resolves the current
+commit of the model (or `--revision` you give it) and puts `--revision <commit>` into every
+command it prints — keep it. In Python: `load_stage(..., revision=resolve_revision(model_id))`.
+Use the same distllm version on all machines too.
+
 Rules of thumb:
 
 - **As few stages as memory allows.** Every stage adds a network hop per token.
@@ -167,6 +174,6 @@ tokenizer).
 | `CUDA out of memory` | fewer layers on that machine, `--quantize nf4`, smaller `--context` / shorter prompts |
 | everything stalls ~30 s, then continues | a worker missed heartbeats; its task was re-queued |
 | `TaskLostError` | the relay restarted; the generator replays automatically |
-| garbage output only with one participant | that worker computes wrongly (wrong model id/revision, broken GPU, or bad intent) |
+| garbage output only with one participant | that worker computes wrongly: a different `--revision` (or none), wrong model id, broken GPU, or bad intent — `--audit-roles` names it |
 
 See also: [architecture](architecture.md), [Colab guide](colab.md).

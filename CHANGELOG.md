@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Model revision pinning: `load_stage(..., revision=)`, `resolve_revision()`, `--revision` in
+  the examples; `plan_split.py` pins the current commit in every command it prints.
 - Rust relay (`relay-rs/`, axum + tokio): drop-in replacement with the same protocol;
   ~2.2× lower per-hop latency, 3.6 MB RSS instead of ~240 MB. HTTP conformance suite
   `tests/test_relay_http.py` runs against both relays.

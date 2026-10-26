@@ -127,6 +127,9 @@ doubled the traffic; it is still decoded). Only a whitelist of dtypes is accepte
 2. Map stage parameter names to checkpoint names (`layers.{i}` → `layers.{layer_start+i}`);
    embeddings for the first stage, final norm and `lm_head` for the last (with tied
    embeddings `lm_head` reuses the embedding matrix).
+   `revision` pins the Hub commit (all stages of a pipeline must load the same one;
+   `resolve_revision(model_id)` gives the current commit of `main`). An unknown revision
+   fails before any download.
 3. Download only the shards that contain those tensors (via the safetensors/bin index) and
    read them lazily, **one transformer layer at a time**: convert to the dtype, optionally
    quantize the block's `nn.Linear` layers with bitsandbytes (nf4/fp4/int8) while moving

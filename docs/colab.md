@@ -53,6 +53,7 @@ os.environ["DISTLLM_WORKER_TOKEN"] = userdata.get("DISTLLM_WORKER_TOKEN")
 RELAY_URL = "https://<random-words>.trycloudflare.com"
 
 MODEL_ID = "Qwen/Qwen2.5-14B-Instruct"   # 48 layers
+REVISION = "<commit hash>"                # same in every notebook: distllm.hf.resolve_revision(MODEL_ID)
 ROLE, FIRST, LAST = "stage-0", 0, 23      # second notebook: "stage-1", 24, 47
 ```
 
@@ -62,7 +63,7 @@ from distllm.hf import load_stage
 
 # Downloads only the shards with layers FIRST..LAST and quantizes layer by layer:
 # the 12 GB of Colab RAM are enough although this fp16 slice alone is ~13 GB.
-stage = load_stage(MODEL_ID, FIRST, LAST, quantize="nf4")
+stage = load_stage(MODEL_ID, FIRST, LAST, quantize="nf4", revision=REVISION)
 print(stage.name, stage.device, stage.dtype)
 
 @worker_node(role=ROLE, relay_url=RELAY_URL)
@@ -80,7 +81,7 @@ T4 has no fast bfloat16, so `dtype="auto"` picks float16 there.
 uv run python examples/distributed_hf/client_hf.py \
     --model-id Qwen/Qwen2.5-14B-Instruct \
     --relay-url https://<random-words>.trycloudflare.com \
-    --workers stage-0,stage-1 --route \
+    --workers stage-0,stage-1 --route --revision <commit hash> \
     --prompt "Explain pipeline parallelism in two sentences." --max-tokens 64
 ```
 

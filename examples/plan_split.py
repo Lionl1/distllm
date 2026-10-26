@@ -28,11 +28,11 @@ HEADROOM = 0.85
 _LAYER_RE = re.compile(r"(^|\.)layers\.(\d+)\.")
 
 
-def layer_sizes(model_id: str, token: str | None = None):
+def layer_sizes(model_id: str, token: str | None = None, revision: str | None = None):
     """Parameter counts: per transformer layer, embeddings, and final norm + lm_head."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    config = AutoConfig.from_pretrained(model_id, token=token)
+    config = AutoConfig.from_pretrained(model_id, token=token, revision=revision)
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config)
     per_layer: dict[int, int] = defaultdict(int)
@@ -127,6 +127,8 @@ def main() -> None:
     parser.add_argument("--context", type=int, default=4096, help="tokens of KV cache to reserve per session")
     parser.add_argument("--relay-url", default="https://RELAY")
     parser.add_argument("--token", default=None, help="Hugging Face token for gated models")
+    parser.add_argument("--revision", default=None,
+                        help="branch/tag/commit to plan for (default: the current commit of main, pinned)")
     args = parser.parse_args()
 
     nodes = []
@@ -134,10 +136,15 @@ def main() -> None:
         name, gb, *count = item.split(":")
         nodes.append((name.strip(), float(gb), int(count[0]) if count else None))
 
-    config, layers, embed, head, kv_width = layer_sizes(args.model_id, args.token)
+    from distllm.hf import resolve_revision
+
+    # Pin one commit for everybody: each machine downloads its own slice of the weights.
+    revision = resolve_revision(args.model_id, args.revision, args.token)
+    config, layers, embed, head, kv_width = layer_sizes(args.model_id, args.token, revision)
     stages = plan(layers, embed, head, kv_width, nodes, args.quantize, args.dtype, args.context)
 
-    print(f"{args.model_id}: {len(layers)} layers, {sum(layers) / 1e9:.1f}B params in blocks, "
+    print(f"{args.model_id}" + (f" @ {revision}" if revision else "") + f": {len(layers)} layers, "
+          f"{sum(layers) / 1e9:.1f}B params in blocks, "
           f"weights {args.quantize or args.dtype}, KV for {args.context} tokens\n")
     print(f"{'machine':<10} {'role':<9} {'layers':<10} {'est. GB':>8} / {'machine GB':>10}")
     for i, (name, a, b, used, cap) in enumerate(stages):
@@ -145,13 +152,14 @@ def main() -> None:
 
     print("\nCommands:")
     quant = f" --quantize {args.quantize}" if args.quantize else ""
+    pin = f" --revision {revision}" if revision else ""
     for i, (name, a, b, _, _) in enumerate(stages):
         print(f"  [{name}] uv run python examples/distributed_hf/worker_hf.py --model-id {args.model_id} "
               f"--layer-start {a} --layer-end {b} --role stage-{i} --relay-url {args.relay_url}"
-              f" --dtype {args.dtype}{quant}")
+              f" --dtype {args.dtype}{quant}{pin}")
     roles = ",".join(f"stage-{i}" for i in range(len(stages)))
     print(f"  [client] uv run python examples/distributed_hf/client_hf.py --model-id {args.model_id} "
-          f"--workers {roles} --relay-url {args.relay_url} --route")
+          f"--workers {roles} --relay-url {args.relay_url} --route{pin}")
 
 
 if __name__ == "__main__":

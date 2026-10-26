@@ -72,15 +72,31 @@ def _resolve_dtype(dtype: Optional[str], device: torch.device, config: Any = Non
         raise ValueError(f"Unsupported dtype {dtype!r}") from exc
 
 
-def _weight_files(model_id: str, needed: set[str], token: Optional[str]) -> list[str]:
+def resolve_revision(model_id: str, revision: Optional[str] = None, token: Optional[str] = None) -> Optional[str]:
+    """The commit hash a branch/tag (default: main) of a Hub model points to right now.
+
+    Every participant of a pipeline downloads its own slice of the weights; pinning all
+    of them to one commit guarantees the slices come from the same model even if the
+    repository is updated in between. Local directories have no revision (None).
+    """
+    if os.path.isdir(model_id):
+        return None
+    from huggingface_hub import HfApi
+
+    return HfApi().model_info(model_id, revision=revision, token=token).sha
+
+
+def _weight_files(model_id: str, needed: set[str], token: Optional[str], revision: Optional[str] = None) -> list[str]:
     """Return local paths of only those checkpoint files that contain needed tensors."""
     from huggingface_hub import hf_hub_download, list_repo_files
 
     local = os.path.isdir(model_id)
-    files = os.listdir(model_id) if local else list_repo_files(model_id, token=token)
+    files = os.listdir(model_id) if local else list_repo_files(model_id, revision=revision, token=token)
 
     def fetch(name: str) -> str:
-        return os.path.join(model_id, name) if local else hf_hub_download(model_id, name, token=token)
+        if local:
+            return os.path.join(model_id, name)
+        return hf_hub_download(model_id, name, revision=revision, token=token)
 
     for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
         if index_name in files:
@@ -179,6 +195,7 @@ def load_stage(
     device: Optional[str] = "auto",
     dtype: Optional[str] = "auto",
     token: Optional[str] = None,
+    revision: Optional[str] = None,
     quantize: Optional[str] = None,
     max_sessions: int = 8,
     session_ttl: float = 600.0,
@@ -191,10 +208,19 @@ def load_stage(
     transformer block are quantized as they are loaded, so peak memory is the
     quantized stage plus one full-precision layer. Embeddings, final norm and
     ``lm_head`` stay in ``dtype``.
+
+    ``revision`` (branch, tag or commit hash) pins the Hub version of the model; give all
+    stages of a pipeline the same commit (see :func:`resolve_revision`).
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    config = AutoConfig.from_pretrained(model_id, token=token)
+    if revision is not None and not os.path.isdir(model_id):
+        # transformers turns an unknown revision into a confusing "Unrecognized model" error.
+        try:
+            resolve_revision(model_id, revision, token)
+        except Exception as exc:
+            raise ValueError(f"Revision {revision!r} not found for {model_id}: {exc}") from exc
+    config = AutoConfig.from_pretrained(model_id, token=token, revision=revision)
     n_layers = config.num_hidden_layers
     if not (0 <= layer_start <= layer_end < n_layers):
         raise ValueError(
@@ -228,7 +254,7 @@ def load_stage(
         elif is_last:
             wanted[name] = name  # final norm, lm_head
 
-    reader = _CheckpointReader(_weight_files(model_id, set(wanted.values()), token))
+    reader = _CheckpointReader(_weight_files(model_id, set(wanted.values()), token, revision))
     base = getattr(model, model.base_model_prefix)
     try:
         lm_head_from_embed = (
@@ -302,7 +328,8 @@ def load_stage(
         dtype=torch_dtype,
         max_sessions=max_sessions,
         session_ttl=session_ttl,
-        name=f"{model_id}[{layer_start}:{layer_end}]" + (f" {quantize}" if quantize else ""),
+        name=f"{model_id}" + (f"@{revision[:12]}" if revision else "") + f"[{layer_start}:{layer_end}]"
+        + (f" {quantize}" if quantize else ""),
     )
 
 
