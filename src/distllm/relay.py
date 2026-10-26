@@ -17,6 +17,31 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="distllm Relay Server", lifespan=lifespan)
 
+# --- Network latency simulation (for local experiments) ---
+# Every HTTP request to the relay costs one round trip on a real network. These
+# settings add that round trip artificially: half before handling (request in
+# flight), half after (response in flight). Workers and clients usually sit at
+# different distances from the relay (e.g. Colab GPUs vs. a laptop), hence two knobs.
+WORKER_PATHS = ("/register", "/deregister", "/heartbeat", "/poll", "/result", "/fail")
+simulated_rtt = {"worker": 0.0, "client": 0.0}  # seconds
+
+
+def set_simulated_latency(worker_rtt_ms: float = 0.0, client_rtt_ms: float = 0.0) -> None:
+    simulated_rtt["worker"] = max(0.0, worker_rtt_ms) / 1000.0
+    simulated_rtt["client"] = max(0.0, client_rtt_ms) / 1000.0
+
+
+@app.middleware("http")
+async def simulate_network_latency(request: Request, call_next):
+    side = "worker" if request.url.path.startswith(WORKER_PATHS) else "client"
+    rtt = simulated_rtt[side]
+    if rtt <= 0:
+        return await call_next(request)
+    await asyncio.sleep(rtt / 2)
+    response = await call_next(request)
+    await asyncio.sleep(rtt / 2)
+    return response
+
 # --- Task State Management ---
 class Task:
     def __init__(self, task_id: str, sender_id: str, target_role: str, payload: bytes):
@@ -249,5 +274,6 @@ async def get_result(task_id: str, wait: float = 0.0):
         return {"status": "FAILED", "error": error_msg}
     return {"status": task.status}
 
-def start_relay(port: int = 8000):
-    uvicorn.run(app, host="0.0.0.0", port=port)
+def start_relay(port: int = 8000, worker_rtt_ms: float = 0.0, client_rtt_ms: float = 0.0, host: str = "0.0.0.0"):
+    set_simulated_latency(worker_rtt_ms, client_rtt_ms)
+    uvicorn.run(app, host=host, port=port)
