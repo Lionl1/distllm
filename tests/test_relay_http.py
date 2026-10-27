@@ -247,3 +247,24 @@ def test_simulated_latency(relay_factory):
     started = time.perf_counter()
     submit(c, "r")
     assert time.perf_counter() - started < 0.15
+
+
+def test_token_rotation(relay_factory, tmp_path):
+    bearer = lambda t: {"Authorization": f"Bearer {t}"}  # noqa: E731
+
+    def status(c, token):
+        return c.post("/register", params={"node_id": "n", "role": "r"}, headers=bearer(token)).status_code
+
+    # Several tokens at once: both the new and the old one work during the switch.
+    c = relay_factory(token="new-t,old-t")
+    assert (status(c, "new-t"), status(c, "old-t"), status(c, "other")) == (200, 200, 401)
+
+    # A token file is re-read when it changes: rotation without restarting the relay.
+    tokens = tmp_path / "tokens"
+    tokens.write_text("# clients and workers\nfirst-t\n")
+    c = relay_factory(token=f"@{tokens}")
+    assert (status(c, "first-t"), status(c, "second-t")) == (200, 401)
+    tokens.write_text("second-t\n")
+    os.utime(tokens, (time.time() + 5, time.time() + 5))  # a visibly newer mtime
+    time.sleep(1.3)  # the relay checks the file at most once per second
+    assert (status(c, "first-t"), status(c, "second-t")) == (401, 200)

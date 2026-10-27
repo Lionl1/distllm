@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Token rotation without downtime (both relays): a token setting may be `new,old` (any is
+  accepted) or `@file`, re-read when it changes; clients and workers send the first token.
 - Relay restart without recomputation: workers re-register with the sessions they hold
   (`/register?sessions=`, both relays) so session affinity survives, and the generator
   resends a lost step with `rewind` instead of replaying the prefix.

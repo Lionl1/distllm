@@ -71,6 +71,14 @@ def test_clients_send_tokens_from_env(monkeypatch):
     assert Worker("r", "http://relay", token="explicit").client.headers["authorization"] == "Bearer explicit"
 
 
+def test_clients_send_the_first_token_of_a_spec(monkeypatch, tmp_path):
+    monkeypatch.delenv("DISTLLM_WORKER_TOKEN", raising=False)
+    assert Cluster("http://relay", token="new, old").client.headers["authorization"] == "Bearer new"
+    path = tmp_path / "tokens"
+    path.write_text("# rotate here\nfrom-file\nolder\n")
+    assert Worker("r", "http://relay", token=f"@{path}").client.headers["authorization"] == "Bearer from-file"
+
+
 def test_no_token_no_header(monkeypatch):
     monkeypatch.delenv("DISTLLM_TOKEN", raising=False)
     monkeypatch.delenv("DISTLLM_WORKER_TOKEN", raising=False)

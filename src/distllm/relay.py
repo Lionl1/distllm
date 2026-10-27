@@ -1,7 +1,6 @@
 import time
 import asyncio
 import os
-import secrets
 import uuid
 from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -9,6 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 import msgpack
+from .auth import TokenSet
 from .transport import pack_payload, unpack_payload
 
 from contextlib import asynccontextmanager
@@ -55,22 +55,23 @@ async def simulate_network_latency(request: Request, call_next):
 # Shared-secret bearer tokens. Workers and clients may get different tokens: a Colab
 # notebook running a worker then cannot submit tasks, and a client cannot pose as a
 # stage and read other users' hidden states. No token configured = open relay.
-auth_tokens: Dict[str, Optional[str]] = {"client": None, "worker": None}
+# Each side takes a token spec (see auth.py): one token, "new,old" or "@file".
+auth_tokens: Dict[str, TokenSet] = {"client": TokenSet(None), "worker": TokenSet(None)}
 
 
 def set_auth_tokens(token: Optional[str] = None, worker_token: Optional[str] = None) -> None:
     """``token`` protects client endpoints; ``worker_token`` (default: ``token``) worker ones."""
-    auth_tokens["client"] = token or None
-    auth_tokens["worker"] = worker_token or token or None
+    auth_tokens["client"] = TokenSet(token)
+    auth_tokens["worker"] = TokenSet(worker_token or token)
 
 
 @app.middleware("http")
 async def require_token(request: Request, call_next):
     expected = auth_tokens[_side(request.url.path)]
-    if expected is None:
+    if not expected.enabled:
         return await call_next(request)
     scheme, _, value = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(value.strip().encode(), expected.encode()):
+    if scheme.lower() != "bearer" or not expected.accepts(value.strip()):
         return JSONResponse({"detail": "Invalid or missing token"}, status_code=401)
     return await call_next(request)
 

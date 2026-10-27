@@ -123,8 +123,10 @@ So:
   machine and give the same value to every worker (`pip install distllm[encryption]`).
   Prompts, hidden states and tokens then cross the relay and the tunnel encrypted; the relay
   host learns only who talks to whom, when and how much. Workers still see what they compute.
-- Tokens are bearer secrets: share them over a private channel, rotate them when someone
-  leaves, use HTTPS or a private network.
+- Tokens are bearer secrets: share them over a private channel, use HTTPS or a private
+  network, and rotate them when someone leaves: start the relay with
+  `--worker-token @workers.txt`, put the new token on the first line above the old one,
+  hand it out, then delete the old line. The relay picks up changes within a second.
 
 ## 5. Run it
 
