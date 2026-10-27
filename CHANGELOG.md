@@ -4,6 +4,11 @@
 
 - Benchmark against llama.cpp RPC (`benchmarks/compare_llamacpp.sh`, `delay_proxy.py`): speed
   on loopback and at 60 ms RTT, and what happens when a node dies; Petals attempt documented.
+- Chaos tests (`pytest -m chaos`, own CI job): kill / freeze / partition a worker, kill a
+  bound replica, restart the relay mid-generation, per-stage and through routes, against both
+  relays; output must equal the full model byte for byte (14 scenarios pass).
+- Configurable failure detection: relay `--task-timeout` / `--node-timeout`, worker
+  `DISTLLM_HEARTBEAT_INTERVAL`; `Cluster.submit` retries connection errors for up to 60 s.
 - Offline loading: checkpoint files are requested by name instead of listing the
   repository, so a cached (pinned) model loads with `HF_HUB_OFFLINE=1`; an unknown revision
   is diagnosed only after a failed load.

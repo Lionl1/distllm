@@ -38,6 +38,27 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
+  chaos:
+    name: chaos (ubuntu, both relays)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: relay-rs
+      - name: Build the Rust relay
+        working-directory: relay-rs
+        run: cargo build --release
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Chaos tests (kill, freeze, partition, relay restart)
+        run: |
+          uv sync --extra test
+          uv run pytest -q -m chaos tests/test_chaos.py
+
   rust-relay:
     name: rust-relay (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

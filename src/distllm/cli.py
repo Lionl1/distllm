@@ -13,6 +13,8 @@ def relay(
     token: str = typer.Option(None, envvar="DISTLLM_TOKEN", help="Bearer token required from clients (and workers, unless --worker-token)."),
     worker_token: str = typer.Option(None, envvar="DISTLLM_WORKER_TOKEN", help="Separate bearer token for workers."),
     host: str = typer.Option("0.0.0.0", help="Interface to bind."),
+    task_timeout: float = typer.Option(30.0, help="Seconds before an assigned task without a result is re-queued."),
+    node_timeout: float = typer.Option(30.0, help="Seconds without a heartbeat before a worker is considered dead."),
 ):
     """Starts the distllm Relay server."""
     typer.echo(f"Starting Relay on {host}:{port}...")
@@ -23,6 +25,7 @@ def relay(
     start_relay(
         port=port, worker_rtt_ms=simulate_worker_rtt_ms, client_rtt_ms=simulate_client_rtt_ms,
         host=host, token=token, worker_token=worker_token,
+        task_timeout=task_timeout, node_timeout=node_timeout,
     )
 
 @app.command()

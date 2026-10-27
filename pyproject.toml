@@ -54,6 +54,8 @@ test = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["chaos: slow failure-injection tests (kill/freeze/partition/relay restart); run with -m chaos"]
+addopts = "-m 'not chaos'"
 
 [project.scripts]
 distllm = "distllm.cli:app"

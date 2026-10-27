@@ -8,8 +8,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, watch};
 use tokio::time::Instant as TokioInstant;
 
-pub const TASK_TIMEOUT: Duration = Duration::from_secs(30);
-pub const NODE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESULT_WAIT: f64 = 60.0;
 pub const FINISHED_TTL: Duration = Duration::from_secs(300);
 pub const DANGLING_TTL: Duration = Duration::from_secs(1800);
@@ -23,6 +21,18 @@ pub struct Settings {
     pub worker_token: Option<String>,
     pub worker_rtt: Duration,
     pub client_rtt: Duration,
+    /// An assigned task without a result for this long is re-queued.
+    pub task_timeout: Duration,
+    /// A worker without a heartbeat for this long is considered dead.
+    pub node_timeout: Duration,
+}
+
+impl Settings {
+    pub fn janitor_interval(&self) -> Duration {
+        Duration::from_secs(5)
+            .min(self.task_timeout / 3)
+            .min(self.node_timeout / 3)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -530,7 +540,7 @@ impl Relay {
         let dead: Vec<String> = g
             .nodes
             .iter()
-            .filter(|(_, n)| now.duration_since(n.last_heartbeat) > NODE_TIMEOUT)
+            .filter(|(_, n)| now.duration_since(n.last_heartbeat) > self.settings.node_timeout)
             .map(|(id, _)| id.clone())
             .collect();
         for id in dead {
@@ -546,7 +556,7 @@ impl Relay {
             .filter(|(_, t)| {
                 t.status == Status::Assigned
                     && t.assigned_at
-                        .map(|a| now.duration_since(a) > TASK_TIMEOUT)
+                        .map(|a| now.duration_since(a) > self.settings.task_timeout)
                         .unwrap_or(false)
             })
             .map(|(id, t)| (id.clone(), t.worker_id.clone().unwrap_or_default()))
@@ -571,7 +581,7 @@ impl Relay {
 }
 
 pub async fn janitor(relay: Arc<Relay>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let mut interval = tokio::time::interval(relay.settings.janitor_interval());
     loop {
         interval.tick().await;
         relay.sweep();
