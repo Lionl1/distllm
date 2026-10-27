@@ -14,7 +14,6 @@ import asyncio
 import statistics
 from pathlib import Path
 
-import torch
 
 from distllm.hf import PipelineGenerator, load_stage
 

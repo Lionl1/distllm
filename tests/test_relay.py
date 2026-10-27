@@ -304,12 +304,12 @@ def test_chain_root_survives_cleanup_while_chain_runs():
 
 @pytest.mark.asyncio
 async def test_queue_get_returns_item_ready_at_timeout():
-    from distllm.relay import _queue_get
+    from distllm.relay import _queue_get_first
 
     q = asyncio.Queue()
     q.put_nowait("t1")
-    assert await _queue_get(q, timeout=0) == "t1"
-    assert await _queue_get(q, timeout=0.01) is None
+    assert await _queue_get_first([q], timeout=0) == "t1"
+    assert await _queue_get_first([q], timeout=0.01) is None
 
 
 def test_failure_message_in_body_and_truncated():

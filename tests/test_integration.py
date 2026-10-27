@@ -1,6 +1,8 @@
 import asyncio
-import torch
+import contextlib
 import multiprocessing
+
+import torch
 
 # Never fork: the test process has already run torch (its OpenMP thread pool is up), and
 # a forked child can inherit a held lock and hang on its first forward. "fork" is the
@@ -106,16 +108,28 @@ async def test_failing_worker_integration(relay_server):
 TINY_LLAMA = "hf-internal-testing/tiny-random-LlamaForCausalLM"
 
 
-def run_stage_worker(layer_start, layer_end, role):
+def run_stage(layer, role, node_id, batched=False):
+    """A worker for one layer of the tiny model (``batched``: decode steps share a forward)."""
     from distllm.hf import load_stage
 
-    stage = load_stage(TINY_LLAMA, layer_start, layer_end, device="cpu", dtype="float32")
+    stage = load_stage(TINY_LLAMA, layer, layer, device="cpu", dtype="float32")
+    handle = stage.handle_batch if batched else stage.handle
+    worker_node(role=role, relay_url="http://localhost:8002", max_batch=8 if batched else 1, batched=batched)(
+        handle
+    ).start(node_id=node_id)
 
-    @worker_node(role=role, relay_url="http://localhost:8002")
-    def process(payload):
-        return stage.handle(payload)
 
-    process.start(node_id=role)
+@contextlib.contextmanager
+def stage_processes(*specs):
+    """Start (layer, role, node_id[, batched]) stage workers; terminate them afterwards."""
+    workers = [SPAWN.Process(target=run_stage, args=spec) for spec in specs]
+    for p in workers:
+        p.start()
+    try:
+        yield
+    finally:
+        for p in workers:
+            p.terminate()
 
 
 @pytest.mark.asyncio
@@ -134,13 +148,7 @@ async def test_hf_pipeline_over_relay(relay_server):
             expected.append(nxt)
             seq = torch.cat([seq, torch.tensor([[nxt]])], dim=1)
 
-    workers = [
-        SPAWN.Process(target=run_stage_worker, args=(0, 0, "hf-stage-0")),
-        SPAWN.Process(target=run_stage_worker, args=(1, 1, "hf-stage-1")),
-    ]
-    for p in workers:
-        p.start()
-    try:
+    with stage_processes((0, "hf-stage-0", "hf-stage-0"), (1, "hf-stage-1", "hf-stage-1")):
         async with Cluster(relay_server) as cluster:
             roles = ["hf-stage-0", "hf-stage-1"]
             generator = PipelineGenerator(cluster.call, roles)
@@ -156,21 +164,6 @@ async def test_hf_pipeline_over_relay(relay_server):
         assert routed_result.token_ids == expected
         assert speculative_result.token_ids == expected
         assert speculative_result.rounds < 6
-    finally:
-        for p in workers:
-            p.terminate()
-
-
-def run_stage_replica(layer_start, layer_end, role, node_id):
-    from distllm.hf import load_stage
-
-    stage = load_stage(TINY_LLAMA, layer_start, layer_end, device="cpu", dtype="float32")
-
-    @worker_node(role=role, relay_url="http://localhost:8002")
-    def process(payload):
-        return stage.handle(payload)
-
-    process.start(node_id=node_id)
 
 
 @pytest.mark.asyncio
@@ -178,16 +171,8 @@ async def test_replicas_keep_sessions_without_replays(relay_server):
     """Two replicas per stage: affinity keeps each session on the replica with its cache."""
     from distllm.hf import PipelineGenerator
 
-    workers = [
-        SPAWN.Process(target=run_stage_replica, args=(0, 0, "rep-stage-0", f"r0-{i}"))
-        for i in range(2)
-    ] + [
-        SPAWN.Process(target=run_stage_replica, args=(1, 1, "rep-stage-1", f"r1-{i}"))
-        for i in range(2)
-    ]
-    for p in workers:
-        p.start()
-    try:
+    replicas = [(layer, f"rep-stage-{layer}", f"r{layer}-{i}") for layer in (0, 1) for i in range(2)]
+    with stage_processes(*replicas):
         prompt = torch.tensor([[1, 5, 9, 13, 21, 34, 55]])
         async with Cluster(relay_server) as cluster:
             generator = PipelineGenerator(cluster.call, ["rep-stage-0", "rep-stage-1"])
@@ -196,35 +181,13 @@ async def test_replicas_keep_sessions_without_replays(relay_server):
             )
         assert all(r.cache_recoveries == 0 for r in results)
         assert all(r.token_ids == results[0].token_ids for r in results)
-    finally:
-        for p in workers:
-            p.terminate()
-
-
-
-def run_batched_stage(layer_start, layer_end, role):
-    from distllm.hf import load_stage
-
-    stage = load_stage(TINY_LLAMA, layer_start, layer_end, device="cpu", dtype="float32")
-
-    @worker_node(role=role, relay_url="http://localhost:8002", max_batch=8, batched=True)
-    def process(payloads):
-        return stage.handle_batch(payloads)
-
-    process.start(node_id=role)
 
 
 @pytest.mark.asyncio
 async def test_batched_workers_serve_concurrent_sessions(relay_server):
     from distllm.hf import PipelineGenerator
 
-    workers = [
-        SPAWN.Process(target=run_batched_stage, args=(0, 0, "batch-stage-0")),
-        SPAWN.Process(target=run_batched_stage, args=(1, 1, "batch-stage-1")),
-    ]
-    for p in workers:
-        p.start()
-    try:
+    with stage_processes((0, "batch-stage-0", "batch-stage-0", True), (1, "batch-stage-1", "batch-stage-1", True)):
         prompts = [torch.tensor([[1, 5, 9, 13, 21, 34, 55]]), torch.tensor([[2, 4, 8]]),
                    torch.tensor([[3, 1, 4, 1, 5, 9, 2, 6]]), torch.tensor([[7, 7]])]
         async with Cluster(relay_server) as cluster:
@@ -235,6 +198,3 @@ async def test_batched_workers_serve_concurrent_sessions(relay_server):
             sequential = [await generator.generate(p, 8) for p in prompts]
         assert [r.token_ids for r in concurrent] == [r.token_ids for r in sequential]
         assert all(r.cache_recoveries == 0 for r in concurrent)
-    finally:
-        for p in workers:
-            p.terminate()

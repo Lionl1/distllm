@@ -138,12 +138,10 @@ class _CheckpointReader:
                 from safetensors import safe_open
 
                 handle = self._stack.enter_context(safe_open(path, framework="pt"))
-                for key in handle.keys():
-                    self._sources[key] = handle
+                self._sources.update(dict.fromkeys(handle.keys(), handle))
             else:
                 state = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
-                for key in state:
-                    self._sources[key] = state
+                self._sources.update(dict.fromkeys(state, state))
 
     def __contains__(self, key: str) -> bool:
         return key in self._sources
@@ -421,6 +419,23 @@ class PipelineStage:
         while len(self._sessions) > self.max_sessions:
             self._sessions.popitem(last=False)
 
+    def _inputs(self, payloads: list) -> dict:
+        """Model inputs for the new tokens of ``payloads`` (one row each)."""
+        key = "input_ids" if self.is_first else "hidden_states"
+        if any(key not in p for p in payloads):
+            raise ValueError(f"{'first stage' if self.is_first else 'stage'} expects {key!r}")
+        new = torch.cat([p[key] for p in payloads]).to(self.device)
+        return {"input_ids": new} if self.is_first else {"inputs_embeds": new.to(self.dtype)}
+
+    def _output(self, hidden: torch.Tensor, payload: dict) -> dict:
+        """What one request gets back for its (1, new_tokens, hidden) output."""
+        if self.is_last and payload.get("output") == "argmax":
+            return {"argmax": self.model.lm_head(hidden[0]).argmax(dim=-1).cpu()}
+        if self.is_last:
+            return {"logits": self.model.lm_head(hidden[:, -1, :]).float().cpu()}
+        # A ready payload for the next stage, so the relay can forward it as is (routes).
+        return {**{k: payload[k] for k in self.CONTROL_KEYS if k in payload}, "hidden_states": hidden.cpu()}
+
     def cached_length(self, session_id: str) -> int:
         with self._lock:
             sess = self._sessions.get(session_id)
@@ -454,18 +469,8 @@ class PipelineStage:
                 # stop_chain: the relay must not forward this answer to the next stage.
                 return {"cache_miss": True, "cached": sess.length if sess else 0, "stop_chain": True}
 
-            if self.is_first:
-                if "input_ids" not in payload:
-                    raise ValueError("first stage expects 'input_ids'")
-                inputs = {"input_ids": payload["input_ids"].to(self.device)}
-                new_tokens = inputs["input_ids"].shape[1]
-            else:
-                if "hidden_states" not in payload:
-                    raise ValueError("stage expects 'hidden_states'")
-                hidden = payload["hidden_states"].to(self.device, self.dtype)
-                inputs = {"inputs_embeds": hidden}
-                new_tokens = hidden.shape[1]
-
+            inputs = self._inputs([payload])
+            new_tokens = next(iter(inputs.values())).shape[1]
             position_ids = torch.arange(
                 start_pos, start_pos + new_tokens, device=self.device
             ).unsqueeze(0)
@@ -485,16 +490,7 @@ class PipelineStage:
                 self._sessions.pop(session_id, None)
                 raise
             with torch.inference_mode():
-                hidden = out.last_hidden_state
-                if self.is_last and payload.get("output") == "argmax":
-                    result = {"argmax": self.model.lm_head(hidden[0]).argmax(dim=-1).cpu()}
-                elif self.is_last:
-                    result = {"logits": self.model.lm_head(hidden[:, -1, :]).float().cpu()}
-                else:
-                    # The output is a ready payload for the next stage, so the relay can
-                    # forward it as is (chained routes).
-                    result = {k: payload[k] for k in self.CONTROL_KEYS if k in payload}
-                    result["hidden_states"] = hidden.cpu()
+                result = self._output(out.last_hidden_state, payload)
 
             sess.length = start_pos + new_tokens
             sess.last_used = time.time()
@@ -583,32 +579,16 @@ class PipelineStage:
         for row, length in enumerate(lengths):
             mask[row, : longest - length] = 0  # padding is never attended to
         position_ids = torch.tensor(lengths, device=self.device).unsqueeze(1)
-        if self.is_first:
-            inputs = {"input_ids": torch.cat([p["input_ids"] for p in payloads]).to(self.device)}
-        else:
-            hidden = torch.cat([p["hidden_states"] for p in payloads]).to(self.device, self.dtype)
-            inputs = {"inputs_embeds": hidden}
-
         with torch.inference_mode():
             out = self.base(
-                **inputs,
+                **self._inputs(payloads),
                 attention_mask=mask,
                 position_ids=position_ids,
                 past_key_values=batched,
                 use_cache=True,
             )
             hidden = out.last_hidden_state  # (batch, 1, hidden)
-            results = []
-            for row, payload in enumerate(payloads):
-                h = hidden[row : row + 1]
-                if self.is_last and payload.get("output") == "argmax":
-                    results.append({"argmax": self.model.lm_head(h[0]).argmax(dim=-1).cpu()})
-                elif self.is_last:
-                    results.append({"logits": self.model.lm_head(h[:, -1, :]).float().cpu()})
-                else:
-                    result = {k: payload[k] for k in self.CONTROL_KEYS if k in payload}
-                    result["hidden_states"] = h.cpu()
-                    results.append(result)
+            results = [self._output(hidden[row : row + 1], p) for row, p in enumerate(payloads)]
 
         # Unpad: every session keeps its own cache, now one token longer.
         now = time.time()
@@ -739,6 +719,12 @@ def _similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.nn.functional.cosine_similarity(a, b, dim=0))
 
 
+def _prompt_and_eos(input_ids: torch.Tensor, eos_token_id) -> set:
+    if input_ids.dim() != 2 or input_ids.shape[0] != 1:
+        raise ValueError("input_ids must have shape (1, seq_len): batching is not supported")
+    return {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])
+
+
 class PipelineGenerator:
     """Greedy generation through pipeline stages.
 
@@ -773,25 +759,48 @@ class PipelineGenerator:
         if audit is not None and audit.seed is None:
             self._audit_rng.seed()
 
+    async def _through(self, payload: dict, chain: Optional[list] = None) -> dict:
+        """The response of the last stage of ``chain`` (default: the pipeline, via the
+        route if there is one), or of the first stage that did not pass hidden states on."""
+        if chain is None and self.route_call is not None:
+            return await self.route_call(self.roles, payload)
+        for role in chain or self.roles:
+            response = await self.call(role, payload)
+            if "hidden_states" not in response:
+                return response
+            payload = response  # a ready payload for the next stage (control keys + hidden states)
+        return response
+
+    async def _step(self, payload: dict, key: str = "logits") -> Optional[torch.Tensor]:
+        """``key`` ("logits" or "argmax") from the last stage; None on a cache miss.
+
+        If the relay loses the task (e.g. it restarted), stages may or may not have
+        advanced their caches: the step is sent again with ``rewind`` — a stage that
+        already ran it crops back to start_pos, one that did not just runs it. Only if
+        that is lost too it is reported as a cache miss (the caller replays the prefix).
+        """
+        for attempt in (payload, {**payload, "rewind": True}):
+            try:
+                response = await self._through(attempt)
+            except TaskLostError:
+                continue
+            if response.get("cache_miss"):
+                return None
+            if key not in response:
+                raise RuntimeError(f"pipeline did not end with {key!r} — check the layer ranges of the roles")
+            return response[key]
+        return None
+
     async def _run_fresh(self, chain: list, sequence: torch.Tensor) -> torch.Tensor:
         """Last-position logits of ``sequence`` through ``chain``, in a throwaway session."""
         session_id = "audit-" + uuid.uuid4().hex
-        payload: dict = {"session_id": session_id, "start_pos": 0, "input_ids": sequence}
         try:
-            for role in chain:
-                response = await self.call(role, payload)
-                if "logits" in response:
-                    return response["logits"]
-                if response.get("cache_miss") or "hidden_states" not in response:
-                    raise RuntimeError(f"audit chain broke at {role}: {sorted(response)}")
-                payload = {"session_id": session_id, "start_pos": 0, "hidden_states": response["hidden_states"]}
-            raise RuntimeError("audit chain did not end with logits")
+            response = await self._through({"session_id": session_id, "start_pos": 0, "input_ids": sequence}, chain)
+            if "logits" not in response:
+                raise RuntimeError(f"audit chain did not end with logits: {sorted(response)}")
+            return response["logits"]
         finally:
-            for role in set(chain):
-                try:
-                    await self.call(role, {"session_id": session_id, "close": True})
-                except Exception:  # noqa: BLE001 — best effort
-                    pass
+            await self._close(session_id, set(chain))
 
     async def _check(self, sequence: torch.Tensor, logits: torch.Tensor) -> None:
         audit = self.audit
@@ -815,37 +824,7 @@ class PipelineGenerator:
 
     async def _forward(self, session_id: str, start_pos: int, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
         """Run new tokens through all stages; return last-token logits or None on cache miss."""
-        payload: dict = {"session_id": session_id, "start_pos": start_pos, "input_ids": input_ids}
-        try:
-            return await self._forward_once(payload)
-        except TaskLostError:
-            pass
-        # The relay lost the task (e.g. it restarted): stages may or may not have advanced
-        # their caches. Send the same step again with ``rewind``: a stage that already ran
-        # it crops back to start_pos, one that did not just runs it. Only if that fails too,
-        # recover like a cache miss (replay the prefix).
-        try:
-            return await self._forward_once({**payload, "rewind": True})
-        except TaskLostError:
-            return None
-
-    async def _forward_once(self, payload: dict) -> Optional[torch.Tensor]:
-        session_id, start_pos = payload["session_id"], payload["start_pos"]
-        if self.route_call is not None:
-            response = await self.route_call(self.roles, payload)
-            if response.get("cache_miss"):
-                return None
-            if "logits" not in response:
-                raise RuntimeError("route did not end with logits — check the layer ranges of the roles")
-            return response["logits"]
-        for role in self.roles:
-            response = await self.call(role, payload)
-            if response.get("cache_miss"):
-                return None
-            if "logits" in response:
-                return response["logits"]
-            payload = response  # a ready payload for the next stage (control keys + hidden states)
-        raise RuntimeError("last stage did not return logits — check the layer ranges of the roles")
+        return await self._step({"session_id": session_id, "start_pos": start_pos, "input_ids": input_ids})
 
     async def generate(
         self,
@@ -857,9 +836,7 @@ class PipelineGenerator:
         sampling: Optional[SamplingParams] = None,
     ) -> GenerationResult:
         """Generate up to ``max_new_tokens``; greedy unless ``sampling`` says otherwise."""
-        if input_ids.dim() != 2 or input_ids.shape[0] != 1:
-            raise ValueError("input_ids must have shape (1, seq_len): batching is not supported")
-        eos = {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])
+        eos = _prompt_and_eos(input_ids, eos_token_id)
         sampling = sampling or SamplingParams()
         rng = sampling.generator()
         audits = 0
@@ -920,12 +897,10 @@ class PipelineGenerator:
             audits=audits,
         )
 
-    async def _close(self, session_id: str) -> None:
-        for role in self.roles:
-            try:
+    async def _close(self, session_id: str, roles=None) -> None:
+        for role in roles or self.roles:
+            with contextlib.suppress(Exception):  # best effort: caches also expire by TTL
                 await self.call(role, {"session_id": session_id, "close": True})
-            except Exception:  # noqa: BLE001 — cleanup is best-effort, caches also expire by TTL
-                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1016,31 +991,8 @@ class SpeculativeGenerator:
         self.max_recoveries_per_step = max_recoveries_per_step
 
     async def _verify(self, session_id: str, start_pos: int, tokens: torch.Tensor) -> Optional[torch.Tensor]:
-        payload: dict = {
-            "session_id": session_id,
-            "start_pos": start_pos,
-            "rewind": True,
-            "output": "argmax",
-            "input_ids": tokens,
-        }
-        pipeline = self.pipeline
-        try:
-            if pipeline.route_call is not None:
-                response = await pipeline.route_call(pipeline.roles, payload)
-            else:
-                response = {}
-                for role in pipeline.roles:
-                    response = await pipeline.call(role, payload)
-                    if response.get("cache_miss") or "argmax" in response:
-                        break
-                    payload = response
-        except TaskLostError:
-            return None  # recover like a cache miss: full replay
-        if response.get("cache_miss"):
-            return None
-        if "argmax" not in response:
-            raise RuntimeError("last stage did not return argmax — check the layer ranges of the roles")
-        return response["argmax"]
+        payload = {"session_id": session_id, "start_pos": start_pos, "rewind": True, "output": "argmax", "input_ids": tokens}
+        return await self.pipeline._step(payload, "argmax")
 
     async def generate(
         self,
@@ -1050,9 +1002,7 @@ class SpeculativeGenerator:
         eos_token_id: Optional[int | list[int]] = None,
         on_token: Optional[Callable[[int], None]] = None,
     ) -> SpeculativeResult:
-        if input_ids.dim() != 2 or input_ids.shape[0] != 1:
-            raise ValueError("input_ids must have shape (1, seq_len): batching is not supported")
-        eos = {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])
+        eos = _prompt_and_eos(input_ids, eos_token_id)
 
         session_id = uuid.uuid4().hex
         sequence = input_ids.clone()
