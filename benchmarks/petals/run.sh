@@ -31,4 +31,3 @@ timeout 300 $PY bench_petals.py kill s2.pid || echo "RESULT kill s2: no answer w
 server s2b 16:32 31333 --initial_peers "$(cat peer.txt)"; wait_started s2b; sleep 15
 timeout 300 $PY bench_petals.py kill s3.pid || echo "RESULT kill s3: no answer within 300 s"
 kill $(cat s1.pid s2b.pid) 2>/dev/null
-for f in s1 s2 s3 s2b; do echo "== $f.log"; grep -vE "UserWarning|warnings.warn" $f.log | tail -15; done
