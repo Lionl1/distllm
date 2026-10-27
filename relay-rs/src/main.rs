@@ -7,6 +7,7 @@
 // only built on the error path, so its size does not matter.
 #![allow(clippy::result_large_err)]
 
+mod auth;
 mod state;
 
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ use axum::routing::{get, post};
 use clap::Parser;
 use serde_json::json;
 
+use auth::TokenSet;
 use state::{Relay, ResultView, Settings};
 
 #[derive(Parser, Debug)]
@@ -34,10 +36,11 @@ struct Args {
     /// Interface to bind.
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
-    /// Bearer token required from clients (and workers, unless --worker-token).
+    /// Bearer token required from clients (and workers, unless --worker-token):
+    /// `tok`, `new,old` (any is accepted) or `@file` (re-read when it changes).
     #[arg(long, env = "DISTLLM_TOKEN")]
     token: Option<String>,
-    /// Separate bearer token for workers.
+    /// Separate bearer token(s) for workers, same forms as --token.
     #[arg(long, env = "DISTLLM_WORKER_TOKEN")]
     worker_token: Option<String>,
     /// Add artificial round-trip latency to worker requests (experiments only).
@@ -155,9 +158,7 @@ async fn require_token(State(relay): State<Shared>, request: Request, next: Next
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let (scheme, value) = header_value.split_once(' ').unwrap_or((header_value, ""));
-        if !scheme.eq_ignore_ascii_case("bearer")
-            || !constant_time_eq(value.trim().as_bytes(), expected.as_bytes())
-        {
+        if !scheme.eq_ignore_ascii_case("bearer") || !expected.accepts(value.trim().as_bytes()) {
             return json_response(
                 StatusCode::UNAUTHORIZED,
                 json!({ "detail": "Invalid or missing token" }),
@@ -165,13 +166,6 @@ async fn require_token(State(relay): State<Shared>, request: Request, next: Next
         }
     }
     next.run(request).await
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn simulate_latency(State(relay): State<Shared>, request: Request, next: Next) -> Response {
@@ -406,8 +400,8 @@ async fn main() {
         );
     }
     let settings = Settings {
-        client_token,
-        worker_token,
+        client_token: client_token.as_deref().map(TokenSet::new),
+        worker_token: worker_token.as_deref().map(TokenSet::new),
         worker_rtt: Duration::from_secs_f64(args.simulate_worker_rtt_ms.max(0.0) / 1000.0),
         client_rtt: Duration::from_secs_f64(args.simulate_client_rtt_ms.max(0.0) / 1000.0),
         task_timeout: Duration::from_secs_f64(args.task_timeout.max(0.1)),

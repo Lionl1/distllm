@@ -95,6 +95,13 @@ time. Separate tokens mean a worker notebook cannot submit tasks and a client ca
 register as a stage and read hidden states. Without tokens the relay is open and warns
 when bound to a public interface. Use an HTTPS tunnel — the token is a bearer secret.
 
+Rotation (`auth.py`, same in the Rust relay): a token setting may list several tokens,
+`new,old`, all accepted, or name a file, `@/etc/distllm/tokens` (one token per line or
+comma-separated, `#` comments), which the relay re-reads when it changes (checked at most
+once per second; an unreadable file keeps the last good tokens, and a file never read
+refuses everyone). Clients and workers send the first token of their setting. To rotate:
+add the new token, move clients and workers to it, remove the old one — no restart.
+
 ### End-to-end payload encryption (`crypto.py`)
 
 With `DISTLLM_PAYLOAD_KEY` set on the client and every worker (or `payload_key=` on
