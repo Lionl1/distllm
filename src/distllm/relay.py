@@ -123,6 +123,7 @@ pending_queues: Dict[str, asyncio.Queue] = {} # role -> Queue
 worker_queues: Dict[str, asyncio.Queue] = {} # worker_id -> Queue
 affinity: Dict[tuple, tuple] = {}
 SESSION_AFFINITY_TTL = 900.0
+MAX_REPORTED_SESSIONS = 256  # sessions a worker may claim when it (re-)registers
 
 TASK_TIMEOUT = 30.0 # Seconds before a task is returned to queue
 NODE_TIMEOUT = 30.0 # Seconds before a node is considered dead (3x heartbeat interval)
@@ -258,10 +259,18 @@ async def relay_janitor():
 # --- API Endpoints ---
 
 @app.post("/register")
-async def register(node_id: str, role: str):
+async def register(node_id: str, role: str, sessions: str = ""):
+    """``sessions``: comma-separated sessions whose KV cache the worker holds. After a relay
+    restart the affinity map is empty; workers re-register with their sessions so that the
+    next steps go back to them instead of being replayed on another replica."""
     nodes[node_id] = Node(node_id, role)
     _role_queue(role)
     _worker_queue(node_id)
+    now = time.time()
+    for session in [s for s in sessions.split(",") if s][:MAX_REPORTED_SESSIONS]:
+        entry = affinity.get((role, session))
+        if entry is None or entry[0] not in nodes:  # never steal a session from a live replica
+            affinity[(role, session)] = (node_id, now)
     return {"status": "ok"}
 
 @app.post("/deregister")

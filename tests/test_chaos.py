@@ -322,10 +322,11 @@ def test_network_partition_of_a_worker(env, reference):
 
 
 @pytest.mark.parametrize("route", [False, True], ids=["per-stage", "route"])
-def test_relay_restart_mid_generation(env, reference, route):
+@pytest.mark.parametrize("replicas", [1, 2])
+def test_relay_restart_mid_generation(env, reference, route, replicas):
     relay, procs, _ = env
     procs.append(_start_stage(0, "c-0", relay.url, "s0"))
-    procs.append(_start_stage(1, "c-1", relay.url, "s1"))
+    procs.extend(_start_stage(1, "c-1", relay.url, f"s1-{i}") for i in range(replicas))
     _wait_ready(relay.url)
 
     async def chaos():
@@ -336,4 +337,6 @@ def test_relay_restart_mid_generation(env, reference, route):
 
     result, _ = asyncio.run(_generate_with_chaos(relay.url, chaos, route=route))
     assert result.token_ids == reference
-    assert result.cache_recoveries >= 1
+    # No prefix replay: the lost step is resent with ``rewind``, and the restarted relay
+    # learns from the re-registering workers which replica holds the session.
+    assert result.cache_recoveries == 0

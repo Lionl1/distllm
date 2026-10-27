@@ -35,7 +35,7 @@ integration tests run against either (`DISTLLM_TEST_RELAY=rust`).
 
 | endpoint | side | purpose |
 |---|---|---|
-| `POST /register?node_id&role` | worker | announce a node of a role |
+| `POST /register?node_id&role[&sessions]` | worker | announce a node of a role; `sessions` (comma-separated) claims sessions it holds, e.g. after a relay restart — never taken from a live replica |
 | `POST /heartbeat?node_id` | worker | every 10 s; 404 means "relay restarted, register again" |
 | `POST /deregister?node_id` | worker | graceful exit; its assigned tasks are re-queued at once |
 | `GET /poll/{role}?worker_id&max_tasks` | worker | long-poll (≤ 5 s) for a task: 200 with `{task_id, payload}` (or `{tasks: [...]}` with `max_tasks > 1`), 204 if none |
@@ -260,6 +260,6 @@ heartbeat (`DISTLLM_HEARTBEAT_INTERVAL`, default 10 s); the chaos tests use 3 s 
 | worker restarts | its sessions are gone, replay rebuilds them |
 | result upload fails | worker retries with back-off; if it gives up, the relay re-queues on timeout |
 | task computed twice | first result wins; KV caches stay consistent (`start_pos` check / `rewind`) |
-| relay restarts ✓ | in-flight tasks are lost; workers reconnect and re-register on the next heartbeat; the client retries submissions while the relay is down (up to 60 s) and gets `TaskLostError` for lost tasks → replay (also through routes ✓) |
+| relay restarts ✓ | in-flight tasks are lost; workers re-register on the next heartbeat and claim the sessions whose KV cache they hold (`/register?sessions=`), which rebuilds session affinity; the client retries submissions while the relay is down (up to 60 s), gets `TaskLostError` for a lost step and resends it with `rewind` — no prefix replay, also with replicas and through routes ✓ |
 | forward raises | session dropped, error returned to the client as `RuntimeError("Task failed on worker: ...")` |
 | wrong token | `RelayAuthError` immediately on both sides |

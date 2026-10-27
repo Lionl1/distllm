@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Relay restart without recomputation: workers re-register with the sessions they hold
+  (`/register?sessions=`, both relays) so session affinity survives, and the generator
+  resends a lost step with `rewind` instead of replaying the prefix.
 - End-to-end payload encryption: with `DISTLLM_PAYLOAD_KEY` (or `payload_key=`) clients and
   workers seal every payload and result with ChaCha20-Poly1305; the relay forwards
   ciphertext and needs no changes. `distllm keygen`, extra `distllm[encryption]`; key

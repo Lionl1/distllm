@@ -194,6 +194,20 @@ def test_session_affinity(relay):
     assert poll(relay, "aff", "a2")["task_id"] == third  # moved to the other replica
 
 
+def test_reregistered_worker_reclaims_its_sessions(relay):
+    """After a relay restart the affinity map is empty: a worker claims its sessions back."""
+    relay.post("/register", params={"node_id": "r1", "role": "rec"})
+    relay.post("/register", params={"node_id": "r2", "role": "rec", "sessions": "s7,s8"})
+    bound = submit(relay, "rec", session="s7")
+    free = submit(relay, "rec")
+    assert poll(relay, "rec", "r1")["task_id"] == free  # s7 is not in the role queue...
+    assert poll(relay, "rec", "r2")["task_id"] == bound  # ...it waits for r2
+    # A live replica keeps its session: a later claim by another worker is ignored.
+    relay.post("/register", params={"node_id": "r1", "role": "rec", "sessions": "s8"})
+    again = submit(relay, "rec", session="s8")
+    assert poll(relay, "rec", "r2")["task_id"] == again
+
+
 def test_batched_poll(relay):
     ids = [submit(relay, "bat") for _ in range(5)]
     first = poll(relay, "bat", "bw", max_tasks=3)

@@ -198,7 +198,11 @@ async fn register(State(relay): State<Shared>, Query(p): Params) -> Response {
         (Ok(n), Ok(r)) => (n, r),
         (Err(e), _) | (_, Err(e)) => return e,
     };
-    relay.register(node_id, role);
+    let sessions: Vec<&str> = p
+        .get("sessions")
+        .map(|s| s.split(',').filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    relay.register(node_id, role, &sessions);
     ok("ok")
 }
 
