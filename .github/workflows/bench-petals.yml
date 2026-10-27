@@ -1,0 +1,41 @@
+name: bench-petals
+
+# Manual comparison run: Petals and distllm on the same Linux runner (CPU).
+on:
+  workflow_dispatch:
+  push:
+    branches: [bench/petals-linux]
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Petals (Python 3.11, torch 2.1)
+        run: |
+          uv venv -p 3.11 /tmp/petals
+          echo "setuptools<70" > /tmp/bc.txt
+          uv pip install -p /tmp/petals/bin/python --build-constraint /tmp/bc.txt \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            petals==2.2.0.post1 torch==2.1.2 "numpy<2"
+          PY=/tmp/petals/bin/python bash benchmarks/petals/run.sh 2>&1 | tee petals.txt
+          tail -40 benchmarks/petals/s2.log benchmarks/petals/s3.log || true
+      - name: distllm (same machine)
+        run: |
+          uv sync --extra test
+          uv run python benchmarks/bench_pipeline.py --model-id HuggingFaceTB/SmolLM2-360M \
+            --new-tokens 48 --modes distllm,route --output /tmp/distllm-loopback.md
+          uv run python benchmarks/bench_pipeline.py --model-id HuggingFaceTB/SmolLM2-360M \
+            --draft-model-id HuggingFaceTB/SmolLM2-135M --new-tokens 48 \
+            --worker-rtt-ms 60 --client-rtt-ms 20 --modes distllm,route,spec-6 --output /tmp/distllm-network.md
+          cat /tmp/distllm-loopback.md /tmp/distllm-network.md
+      - name: Summary
+        if: always()
+        run: |
+          { echo '### Petals'; echo '```'; grep -E "RESULT|KILLED|prompt" petals.txt || true; echo '```';
+            cat /tmp/distllm-loopback.md /tmp/distllm-network.md 2>/dev/null; } >> "$GITHUB_STEP_SUMMARY"
