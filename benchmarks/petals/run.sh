@@ -23,9 +23,10 @@ server s3 16:32 31332 --initial_peers "$(cat peer.txt)"
 wait_started s2; wait_started s3
 sleep 15  # let the servers announce themselves in the DHT
 
-$PY bench_petals.py speed
+timeout 600 $PY bench_petals.py speed || echo "RESULT speed: no answer within 600 s"
 # We do not know which replica serves the session: kill each in turn (one run hits it).
-$PY bench_petals.py kill s2.pid
+timeout 300 $PY bench_petals.py kill s2.pid || echo "RESULT kill s2: no answer within 300 s"
 server s2 16:32 31331 --initial_peers "$(cat peer.txt)"; wait_started s2; sleep 15
-$PY bench_petals.py kill s3.pid
+timeout 300 $PY bench_petals.py kill s3.pid || echo "RESULT kill s3: no answer within 300 s"
 kill $(cat s1.pid s2.pid) 2>/dev/null
+for f in s1 s2 s3; do echo "== $f.log"; grep -vE "UserWarning|warnings.warn" $f.log | tail -15; done

@@ -32,7 +32,9 @@ ref = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32).gen
 model = AutoDistributedModelForCausalLM.from_pretrained(MODEL, initial_peers=[PEER], torch_dtype=torch.float32)
 print(f"prompt {ids.shape[1]} tokens, generating {n}", flush=True)
 
+print("warm-up...", flush=True)
 model.generate(ids, max_new_tokens=2, do_sample=False)  # warm-up: routing, connections
+print("warm-up done", flush=True)
 for run in range(3 if mode == "speed" else 1):
     if mode == "kill":
         pid = int(open(sys.argv[2]).read())
