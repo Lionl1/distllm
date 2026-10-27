@@ -221,12 +221,20 @@ target (see [benchmarks](benchmarks.md)).
 
 ## Failure handling at a glance
 
+Rows marked ✓ are exercised by `tests/test_chaos.py` (`pytest -m chaos`, own CI job): real
+processes over HTTP, against both relays, the failure injected after a few tokens of a
+generation, and the result must equal the full model's tokens byte for byte. Detection speed
+is set by the relay's `--node-timeout` / `--task-timeout` (default 30 s) and the workers'
+heartbeat (`DISTLLM_HEARTBEAT_INTERVAL`, default 10 s); the chaos tests use 3 s / 4 s / 0.5 s.
+
 | failure | what happens |
 |---|---|
-| worker dies mid-task | missed heartbeats → task re-queued after ≤ 30 s → next worker of the role; a stage without the cache answers `cache_miss` → client replays the prefix |
-| worker restarts | same; its sessions are gone, replay rebuilds them |
+| worker dies mid-task ✓ | missed heartbeats → task re-queued after the node timeout → next worker of the role (a replica at once, or a new worker when it starts); a stage without the cache answers `cache_miss` → client replays the prefix |
+| worker freezes ✓ | treated as dead; when it wakes up, its stale result is rejected (409: the task is assigned to another worker) |
+| network partition of a worker ✓ | treated as dead while cut; after the link is back the worker re-registers on its next heartbeat |
+| worker restarts | its sessions are gone, replay rebuilds them |
 | result upload fails | worker retries with back-off; if it gives up, the relay re-queues on timeout |
 | task computed twice | first result wins; KV caches stay consistent (`start_pos` check / `rewind`) |
-| relay restarts | workers re-register on the next heartbeat; clients get `TaskLostError` → replay |
+| relay restarts ✓ | in-flight tasks are lost; workers reconnect and re-register on the next heartbeat; the client retries submissions while the relay is down (up to 60 s) and gets `TaskLostError` for lost tasks → replay (also through routes ✓) |
 | forward raises | session dropped, error returned to the client as `RuntimeError("Task failed on worker: ...")` |
 | wrong token | `RelayAuthError` immediately on both sides |
