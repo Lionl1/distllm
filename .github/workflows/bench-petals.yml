@@ -19,10 +19,12 @@ jobs:
       - name: Petals (Python 3.11, torch 2.1)
         run: |
           uv venv -p 3.11 /tmp/petals
-          echo "setuptools<70" > /tmp/bc.txt
+          # Petals 2.2 (2023) with today's dependencies (protobuf 7) runs forward passes but
+          # every inference session breaks; resolve everything as of its time instead.
+          printf 'setuptools<70\ngrpcio-tools<1.61\nprotobuf<4.26\n' > /tmp/bc.txt
           uv pip install -p /tmp/petals/bin/python --index-url https://download.pytorch.org/whl/cpu torch==2.1.2
-          uv pip install -p /tmp/petals/bin/python --build-constraint /tmp/bc.txt \
-            petals==2.2.0.post1 torch==2.1.2 "numpy<2"
+          uv pip install -p /tmp/petals/bin/python --exclude-newer 2024-02-01 --build-constraint /tmp/bc.txt \
+            petals==2.2.0.post1 torch==2.1.2
           PY=/tmp/petals/bin/python bash benchmarks/petals/run.sh 2>&1 | tee petals.txt
           tail -40 benchmarks/petals/s2.log benchmarks/petals/s3.log || true
       - name: distllm (same machine)

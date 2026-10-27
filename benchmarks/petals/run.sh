@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Petals 2.2 private swarm on one Linux machine (CPU): blocks 0:16 + two replicas of 16:32.
-# Needs Python 3.11 with: petals==2.2.0.post1 torch==2.1.2 "numpy<2"
-# (hivemind's build needs setuptools<70: pip install --build-constraint, see the workflow).
+# Needs Python 3.11 with petals==2.2.0.post1 and torch==2.1.2, dependencies resolved as of
+# early 2024 (uv pip install --exclude-newer 2024-02-01, see .github/workflows/bench-petals.yml):
+# with today's protobuf the servers start but every inference session is reset.
 set -u
 PY=${PY:-python}
 M=HuggingFaceTB/SmolLM2-360M
