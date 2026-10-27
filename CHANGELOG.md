@@ -9,6 +9,8 @@
   workers seal every payload and result with ChaCha20-Poly1305; the relay forwards
   ciphertext and needs no changes. `distllm keygen`, extra `distllm[encryption]`; key
   mismatches fail the task with `PayloadDecryptionError`, plaintext is refused.
+- Benchmark against llama.cpp RPC (`benchmarks/compare_llamacpp.sh`, `delay_proxy.py`): speed
+  on loopback and at 60 ms RTT, and what happens when a node dies; Petals attempt documented.
 - Chaos tests (`pytest -m chaos`, own CI job): kill / freeze / partition a worker, kill a
   bound replica, restart the relay mid-generation, per-stage and through routes, against both
   relays; output must equal the full model byte for byte (14 scenarios pass).

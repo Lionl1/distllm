@@ -204,3 +204,27 @@ time per token was 79–83 ms with the Python relay and 73–89 ms with the Rust
 for the model in one process: the relay's 2–3 ms per token are below the noise of a CPU-bound
 run on a busy laptop. The Rust relay pays off in per-hop latency under load, memory, and
 deployment (one static binary on a small VPS, no Python).
+
+## Against llama.cpp RPC and Petals
+
+Same model (SmolLM2-360M, float32, CPU), same machine, two nodes, 48 tokens
+([`benchmarks/compare_llamacpp.sh`](../benchmarks/compare_llamacpp.sh),
+[`results_comparison.md`](../benchmarks/results_comparison.md)):
+
+| setup, tokens/s | llama.cpp RPC | distllm |
+|---|---:|---:|
+| one process | 30.6 | 19.8 |
+| 2 nodes, loopback | 35.3 | 16.0 |
+| 2 nodes, 60 ms RTT | 6.3 | 3.8 (route 4.4) |
+| 2 nodes, 60 ms RTT, speculative k=6 | — | **8.5** |
+
+- **Raw speed:** llama.cpp's ggml kernels are ~1.5x faster than PyTorch on CPU, and over RPC
+  it pays about one round trip per node per token — distllm without speculation is slower.
+  With speculative decoding over the network distllm is 1.35x faster than llama.cpp RPC at
+  60 ms, because it pays round trips per *round*, not per token.
+- **A node dies:** llama.cpp RPC aborts the client process (`Remote RPC server crashed`,
+  SIGABRT) and the generation is lost; distllm finishes it with identical tokens on another
+  worker (the chaos tests). llama.cpp RPC also needs the client to reach every node directly
+  (no NAT traversal) and has no authentication; its README warns against exposing it.
+- **Petals** 2.2 (last release 2023) needs torch 2.1; on macOS arm64 its inference sessions
+  were reset by the server, so there are no numbers yet — to be rerun on Linux.
