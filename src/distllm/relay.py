@@ -1,23 +1,26 @@
-import time
 import asyncio
 import os
+import time
 import uuid
-from typing import Dict, List, Optional, Any
+from collections import defaultdict
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+import msgpack
+import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uvicorn
-import msgpack
-from .auth import TokenSet
-from .transport import pack_payload, unpack_payload
 
-from contextlib import asynccontextmanager
+from .auth import TokenSet
+from .transport import pack_payload
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start the janitor
     asyncio.create_task(relay_janitor())
     yield
+
 
 app = FastAPI(title="distllm Relay Server", lifespan=lifespan)
 
@@ -41,8 +44,7 @@ def _side(path: str) -> str:
 
 @app.middleware("http")
 async def simulate_network_latency(request: Request, call_next):
-    side = _side(request.url.path)
-    rtt = simulated_rtt[side]
+    rtt = simulated_rtt[_side(request.url.path)]
     if rtt <= 0:
         return await call_next(request)
     await asyncio.sleep(rtt / 2)
@@ -68,67 +70,65 @@ def set_auth_tokens(token: Optional[str] = None, worker_token: Optional[str] = N
 @app.middleware("http")
 async def require_token(request: Request, call_next):
     expected = auth_tokens[_side(request.url.path)]
-    if not expected.enabled:
-        return await call_next(request)
-    scheme, _, value = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not expected.accepts(value.strip()):
-        return JSONResponse({"detail": "Invalid or missing token"}, status_code=401)
+    if expected.enabled:
+        scheme, _, value = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not expected.accepts(value.strip()):
+            return JSONResponse({"detail": "Invalid or missing token"}, status_code=401)
     return await call_next(request)
 
-# --- Task State Management ---
-class Task:
-    def __init__(
-        self,
-        task_id: str,
-        sender_id: str,
-        target_role: str,
-        payload: bytes,
-        route: Optional[List[str]] = None,
-        root_id: Optional[str] = None,
-        session: Optional[str] = None,
-    ):
-        self.task_id = task_id
-        self.sender_id = sender_id
-        self.target_role = target_role
-        self.payload = payload
-        # Roles that receive this task's result next (chained pipeline stages).
-        self.route = list(route or [])
-        # The task the sender waits on; the final result of the chain lands there.
-        self.root_id = root_id or task_id
-        # Tasks of one session go to the same worker of a role (it holds the KV cache).
-        self.session = session or None
-        self.status = "PENDING" # PENDING, ASSIGNED, FORWARDED, COMPLETED, FAILED
-        self.worker_id = None
-        self.assigned_at = None
-        self.result = None
-        self.created_at = time.time()
-        self.completed_at = None
-        # Set when the task needs no more work: COMPLETED/FAILED, or FORWARDED for an
-        # intermediate step of a chain. A chain's root is set only when the chain ends.
-        # Long-polling clients wait on it; cleanup uses it to tell live tasks from dead ones.
-        self.done = asyncio.Event()
 
-# --- Registry State ---
+# --- State ---
+@dataclass(eq=False)
+class Task:
+    task_id: str
+    sender_id: str
+    target_role: str
+    payload: bytes
+    # Roles that receive this task's result next (chained pipeline stages).
+    route: List[str] = field(default_factory=list)
+    # The task the sender waits on; the final result of the chain lands there.
+    root_id: Optional[str] = None
+    # Tasks of one session go to the same worker of a role (it holds the KV cache).
+    session: Optional[str] = None
+    status: str = "PENDING"  # PENDING, ASSIGNED, FORWARDED, COMPLETED, FAILED
+    worker_id: Optional[str] = None
+    assigned_at: Optional[float] = None
+    result: Optional[bytes] = None
+    created_at: float = field(default_factory=time.time)
+    completed_at: Optional[float] = None
+    # Set when the task needs no more work: COMPLETED/FAILED, or FORWARDED for an
+    # intermediate step of a chain. A chain's root is set only when the chain ends.
+    # Long-polling clients wait on it; cleanup uses it to tell live tasks from dead ones.
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __post_init__(self):
+        self.root_id = self.root_id or self.task_id
+        self.session = self.session or None
+
+
+@dataclass
 class Node:
-    def __init__(self, node_id: str, role: str):
-        self.node_id = node_id
-        self.role = role
-        self.last_heartbeat = time.time()
+    node_id: str
+    role: str
+    last_heartbeat: float = field(default_factory=time.time)
+
 
 nodes: Dict[str, Node] = {}
 tasks: Dict[str, Task] = {}
-pending_queues: Dict[str, asyncio.Queue] = {} # role -> Queue
+pending_queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)  # role -> task ids
+worker_queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)  # worker_id -> task ids
 # Session affinity: several workers may serve one role (replicas), but a session's KV
 # cache lives on one of them. (role, session) -> (worker_id, last used); tasks of a bound
 # session go to that worker's own queue while it is alive.
-worker_queues: Dict[str, asyncio.Queue] = {} # worker_id -> Queue
 affinity: Dict[tuple, tuple] = {}
 SESSION_AFFINITY_TTL = 900.0
 MAX_REPORTED_SESSIONS = 256  # sessions a worker may claim when it (re-)registers
 
-TASK_TIMEOUT = 30.0 # Seconds before a task is returned to queue
-NODE_TIMEOUT = 30.0 # Seconds before a node is considered dead (3x heartbeat interval)
-JANITOR_INTERVAL = 5.0 # Seconds between janitor sweeps
+TASK_TIMEOUT = 30.0  # seconds before an assigned task without a result is re-queued
+NODE_TIMEOUT = 30.0  # seconds before a silent node is considered dead (3x heartbeat interval)
+JANITOR_INTERVAL = 5.0  # seconds between janitor sweeps
+FINISHED_TTL = 300.0  # finished tasks are kept this long for their senders
+DANGLING_TTL = 1800.0  # unfinished tasks older than this are dropped
 
 
 def set_timeouts(task_timeout: float = 30.0, node_timeout: float = 30.0) -> None:
@@ -137,7 +137,9 @@ def set_timeouts(task_timeout: float = 30.0, node_timeout: float = 30.0) -> None
     TASK_TIMEOUT = max(0.1, task_timeout)
     NODE_TIMEOUT = max(0.1, node_timeout)
     JANITOR_INTERVAL = min(5.0, TASK_TIMEOUT / 3, NODE_TIMEOUT / 3)
-MAX_RESULT_WAIT = 60.0 # Upper bound for long-poll in /get_result
+
+
+MAX_RESULT_WAIT = 60.0  # upper bound for long-poll in /get_result
 FINISHED = ("COMPLETED", "FAILED", "FORWARDED")
 # A worker result containing this key ends a chain early (e.g. a stage cache miss).
 # Workers flag it with ?stop_chain=1; small bodies are also inspected for compatibility.
@@ -145,30 +147,14 @@ STOP_CHAIN_KEY = "stop_chain"
 STOP_CHAIN_SNIFF_LIMIT = 4096  # bytes; hidden-state payloads are never decoded by the relay
 MAX_ERROR_LENGTH = 8000
 
-# --- Background Tasks ---
-def _role_queue(role: str) -> asyncio.Queue:
-    if role not in pending_queues:
-        pending_queues[role] = asyncio.Queue()
-    return pending_queues[role]
-
-
-def _worker_queue(worker_id: str) -> asyncio.Queue:
-    if worker_id not in worker_queues:
-        worker_queues[worker_id] = asyncio.Queue()
-    return worker_queues[worker_id]
-
 
 def _bound_worker(task: Task) -> Optional[str]:
     """The live worker holding this task's session for its role, if any."""
-    if not task.session:
-        return None
-    entry = affinity.get((task.target_role, task.session))
-    if entry is None:
-        return None
-    worker_id = entry[0]
-    node = nodes.get(worker_id)
-    if node is None or node.role != task.target_role:
-        affinity.pop((task.target_role, task.session), None)
+    key = (task.target_role, task.session)
+    worker_id = affinity.get(key, (None,))[0] if task.session else None
+    node = nodes.get(worker_id) if worker_id else None
+    if worker_id and (node is None or node.role != task.target_role):
+        del affinity[key]
         return None
     return worker_id
 
@@ -176,22 +162,17 @@ def _bound_worker(task: Task) -> Optional[str]:
 async def _enqueue(task: Task) -> None:
     tasks[task.task_id] = task
     worker_id = _bound_worker(task)
-    queue = _worker_queue(worker_id) if worker_id else _role_queue(task.target_role)
-    await queue.put(task.task_id)
+    await (worker_queues[worker_id] if worker_id else pending_queues[task.target_role]).put(task.task_id)
 
 
 async def _requeue(task: Task, reason: str) -> None:
     """Return an assigned task to its role queue (any replica may take it)."""
     print(f"Task {task.task_id} {reason}. Re-queuing...")
-    if task.session:
-        # The bound worker is dead or too slow: let another replica take the session.
-        entry = affinity.get((task.target_role, task.session))
-        if entry and entry[0] == task.worker_id:
-            del affinity[(task.target_role, task.session)]
-    task.status = "PENDING"
-    task.worker_id = None
-    task.assigned_at = None
-    await _role_queue(task.target_role).put(task.task_id)
+    key = (task.target_role, task.session)
+    if task.session and affinity.get(key, (None,))[0] == task.worker_id:
+        del affinity[key]  # the bound worker is dead or too slow: let another replica take it
+    task.status, task.worker_id, task.assigned_at = "PENDING", None, None
+    await pending_queues[task.target_role].put(task.task_id)
 
 
 async def _forget_worker(worker_id: str) -> None:
@@ -203,59 +184,57 @@ async def _forget_worker(worker_id: str) -> None:
     while queue is not None and not queue.empty():
         task = tasks.get(queue.get_nowait())
         if task is not None and task.status == "PENDING":
-            await _role_queue(task.target_role).put(task.task_id)
+            await pending_queues[task.target_role].put(task.task_id)
     for key in [k for k, (w, _) in affinity.items() if w == worker_id]:
         del affinity[key]
 
 
 async def cleanup_stuck_tasks():
-    """Recover stuck tasks."""
+    """Re-queue assigned tasks whose worker did not answer within TASK_TIMEOUT."""
     now = time.time()
-    for tid, task in list(tasks.items()):
-        if task.status == "ASSIGNED" and task.assigned_at and (now - task.assigned_at > TASK_TIMEOUT):
+    for task in list(tasks.values()):
+        if task.status == "ASSIGNED" and task.assigned_at and now - task.assigned_at > TASK_TIMEOUT:
             await _requeue(task, f"timed out on worker {task.worker_id}")
 
+
 def cleanup_old_tasks():
-    """Remove old tasks to prevent memory leaks."""
+    """Forget finished and dangling tasks and stale session affinity (no memory leaks).
+
+    A chain root stays FORWARDED (not done) while later stages run — it must survive
+    however long they take, up to DANGLING_TTL.
+    """
     now = time.time()
-    to_delete = []
-    for tid, task in list(tasks.items()):
-        # Clean up finished tasks after 5 minutes. A chain root stays FORWARDED (not done)
-        # while later stages run — it must survive however long they take.
-        if task.done.is_set() and task.completed_at and (now - task.completed_at > 300.0):
-            to_delete.append(tid)
-        # Clean up stuck/dangling tasks older than 30 minutes
-        elif not task.done.is_set() and (now - task.created_at > 1800.0):
-            to_delete.append(tid)
-            
-    for tid in to_delete:
-        try:
-            del tasks[tid]
-        except KeyError:
-            pass
+    for task_id, task in list(tasks.items()):
+        finished = task.done.is_set() and task.completed_at and now - task.completed_at > FINISHED_TTL
+        if finished or (not task.done.is_set() and now - task.created_at > DANGLING_TTL):
+            del tasks[task_id]
     for key in [k for k, (_, used) in affinity.items() if now - used > SESSION_AFFINITY_TTL]:
         del affinity[key]
 
+
+async def _drop_node(node_id: str, why: str) -> None:
+    node = nodes.pop(node_id, None)
+    if node is not None:
+        print(f"Node {node_id} ({node.role}) {why}.")
+        await _forget_worker(node_id)
+
+
 async def relay_janitor():
-    """Cleans up dead nodes, recovers stuck tasks, and prevents memory leaks."""
+    """Drops dead nodes, recovers stuck tasks, forgets old ones."""
     while True:
         now = time.time()
-        
-        # 1. Cleanup Dead Nodes
-        dead_node_ids = [nid for nid, node in list(nodes.items()) if now - node.last_heartbeat > NODE_TIMEOUT]
-        for nid in dead_node_ids:
-            if nid in nodes:
-                print(f"Node {nid} ({nodes[nid].role}) timed out.")
-                del nodes[nid]
-                await _forget_worker(nid)
-
-        # 2. Recover Stuck Tasks
+        for node_id in [n for n, node in nodes.items() if now - node.last_heartbeat > NODE_TIMEOUT]:
+            await _drop_node(node_id, "timed out")
         await cleanup_stuck_tasks()
-        
-        # 3. Clean up old tasks (prevent memory leak)
         cleanup_old_tasks()
-        
         await asyncio.sleep(JANITOR_INTERVAL)
+
+
+def _task(task_id: str) -> Task:
+    if task_id not in tasks:
+        raise HTTPException(status_code=404)
+    return tasks[task_id]
+
 
 # --- API Endpoints ---
 
@@ -265,8 +244,6 @@ async def register(node_id: str, role: str, sessions: str = ""):
     restart the affinity map is empty; workers re-register with their sessions so that the
     next steps go back to them instead of being replayed on another replica."""
     nodes[node_id] = Node(node_id, role)
-    _role_queue(role)
-    _worker_queue(node_id)
     now = time.time()
     for session in [s for s in sessions.split(",") if s][:MAX_REPORTED_SESSIONS]:
         entry = affinity.get((role, session))
@@ -274,20 +251,19 @@ async def register(node_id: str, role: str, sessions: str = ""):
             affinity[(role, session)] = (node_id, now)
     return {"status": "ok"}
 
+
 @app.post("/deregister")
 async def deregister(node_id: str):
-    if node_id in nodes:
-        print(f"Node {node_id} ({nodes[node_id].role}) deregistered gracefully.")
-        del nodes[node_id]
-        await _forget_worker(node_id)
+    await _drop_node(node_id, "deregistered gracefully")
     return {"status": "ok"}
+
 
 @app.post("/heartbeat")
 async def heartbeat(node_id: str):
-    if node_id in nodes:
-        nodes[node_id].last_heartbeat = time.time()
-        return {"status": "ok"}
-    raise HTTPException(status_code=404)
+    if node_id not in nodes:
+        raise HTTPException(status_code=404)
+    nodes[node_id].last_heartbeat = time.time()
+    return {"status": "ok"}
 
 
 @app.post("/submit")
@@ -300,11 +276,11 @@ async def submit_task(request: Request, target_role: str, sender_id: str, route:
     ``session`` pins the tasks of one session to the worker of each role that first
     took it (the one holding its KV cache), as long as that worker is alive.
     """
-    body = await request.body()
     task_id = str(uuid.uuid4())
     next_roles = [r for r in (x.strip() for x in route.split(",")) if r]
-    await _enqueue(Task(task_id, sender_id, target_role, body, route=next_roles, session=session))
+    await _enqueue(Task(task_id, sender_id, target_role, await request.body(), route=next_roles, session=session))
     return {"task_id": task_id}
+
 
 async def _queue_get_first(queues: List[asyncio.Queue], timeout: float) -> Optional[str]:
     """Get an item from the first of ``queues`` that has one, waiting up to ``timeout``.
@@ -330,19 +306,11 @@ async def _queue_get_first(queues: List[asyncio.Queue], timeout: float) -> Optio
         for queue, getter in zip(queues, getters)
         if getter.done() and not getter.cancelled() and getter.exception() is None
     ]
-    if cancelled:
-        for queue, item in got:
-            queue.put_nowait(item)
-        raise asyncio.CancelledError
-    if not got:
-        return None
-    for queue, item in got[1:]:
+    for queue, item in got[0 if cancelled else 1:]:
         queue.put_nowait(item)
-    return got[0][1]
-
-
-async def _queue_get(queue: asyncio.Queue, timeout: float) -> Optional[str]:
-    return await _queue_get_first([queue], timeout)
+    if cancelled:
+        raise asyncio.CancelledError
+    return got[0][1] if got else None
 
 
 def _take(task_id: Optional[str], worker_id: str) -> Optional[Task]:
@@ -350,9 +318,7 @@ def _take(task_id: Optional[str], worker_id: str) -> Optional[Task]:
     task = tasks.get(task_id) if task_id else None
     if task is None or task.status != "PENDING":
         return None
-    task.status = "ASSIGNED"
-    task.worker_id = worker_id
-    task.assigned_at = time.time()
+    task.status, task.worker_id, task.assigned_at = "ASSIGNED", worker_id, time.time()
     if task.session:
         affinity[(task.target_role, task.session)] = (worker_id, task.assigned_at)
     return task
@@ -367,27 +333,18 @@ async def poll_task(role: str, worker_id: str, max_tasks: int = 1):
     that many, so a batching worker can run them in one forward; the response is then
     ``{"tasks": [{"task_id", "payload"}, ...]}`` instead of a single task.
     """
-    own_queue = _worker_queue(worker_id)
-    role_queue = _role_queue(role)
-
-    # Wait up to 5s for a task (long polling): this worker's sessions first.
-    first = _take(await _queue_get_first([own_queue, role_queue], timeout=5.0), worker_id)
+    own, shared = worker_queues[worker_id], pending_queues[role]
+    first = _take(await _queue_get_first([own, shared], timeout=5.0), worker_id)
     if first is None:
         return Response(status_code=204)
     taken = [first]
-    while len(taken) < max(1, max_tasks):
-        queue = own_queue if not own_queue.empty() else role_queue
-        if queue.empty():
-            break
-        task = _take(queue.get_nowait(), worker_id)
+    while len(taken) < max_tasks and not (own.empty() and shared.empty()):
+        task = _take((own if not own.empty() else shared).get_nowait(), worker_id)
         if task is not None:
             taken.append(task)
-
     # Payloads are already msgpack bytes from submit: wrap them without re-encoding.
-    if max_tasks <= 1:
-        body = {"task_id": first.task_id, "payload": first.payload}
-    else:
-        body = {"tasks": [{"task_id": t.task_id, "payload": t.payload} for t in taken]}
+    items = [{"task_id": t.task_id, "payload": t.payload} for t in taken]
+    body = items[0] if max_tasks <= 1 else {"tasks": items}
     return Response(content=pack_payload(body), media_type="application/octet-stream")
 
 
@@ -420,32 +377,21 @@ def _finish(task: Task, status: str, result: bytes) -> None:
     """Complete a task and, for the last step of a chain, its root task too."""
     now = time.time()
     for target in {task.task_id: task, task.root_id: tasks.get(task.root_id)}.values():
-        if target is None or target.done.is_set():
-            continue
-        target.status = status
-        target.result = result
-        target.completed_at = now
-        target.done.set()
+        if target is not None and not target.done.is_set():
+            target.status, target.result, target.completed_at = status, result, now
+            target.done.set()
 
 
 @app.post("/result/{task_id}")
-async def post_result(
-    task_id: str, request: Request, worker_id: Optional[str] = None, stop_chain: bool = False
-):
+async def post_result(task_id: str, request: Request, worker_id: Optional[str] = None, stop_chain: bool = False):
     """Workers submit the result of a task."""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404)
-    
-    task = tasks[task_id]
+    task = _task(task_id)
     body = await request.body()
-    # Задача могла быть переотдана другому воркеру после таймаута: первый результат побеждает.
-    if task.status in FINISHED:
+    if task.status in FINISHED:  # re-assigned after a timeout: the first result wins
         return {"status": "ignored"}
     _check_worker(task, worker_id)
-
     if task.route and not _stops_chain(body, stop_chain):
-        task.status = "FORWARDED"
-        task.completed_at = time.time()
+        task.status, task.completed_at = "FORWARDED", time.time()
         if task.task_id != task.root_id:
             task.done.set()  # nobody waits on an intermediate step
         await _enqueue(Task(
@@ -453,30 +399,25 @@ async def post_result(
             route=task.route[1:], root_id=task.root_id, session=task.session,
         ))
         return {"status": "forwarded"}
-
     _finish(task, "COMPLETED", body)
     return {"status": "ok"}
 
+
 @app.post("/fail/{task_id}")
-async def post_failure(
-    task_id: str, request: Request, error_msg: Optional[str] = None, worker_id: Optional[str] = None
-):
+async def post_failure(task_id: str, request: Request, error_msg: Optional[str] = None, worker_id: Optional[str] = None):
     """Workers report a failed task execution.
 
     The message goes in the request body (plain text); ``?error_msg=`` is still
     accepted, but long messages (tracebacks) do not fit into a URL.
     """
-    if task_id not in tasks:
-        raise HTTPException(status_code=404)
-    
-    task = tasks[task_id]
+    task = _task(task_id)
     if task.status in FINISHED:
         return {"status": "ignored"}
     _check_worker(task, worker_id)
     body = (await request.body()).decode("utf-8", errors="replace")
-    message = (body or error_msg or "unknown error")[:MAX_ERROR_LENGTH]
-    _finish(task, "FAILED", message.encode("utf-8"))
+    _finish(task, "FAILED", (body or error_msg or "unknown error")[:MAX_ERROR_LENGTH].encode())
     return {"status": "ok"}
+
 
 @app.get("/get_result/{task_id}")
 async def get_result(task_id: str, wait: float = 0.0):
@@ -485,23 +426,17 @@ async def get_result(task_id: str, wait: float = 0.0):
     With ``wait > 0`` the request is held (long-poll) until the task finishes or
     ``wait`` seconds pass, so the result is returned as soon as it is ready.
     """
-    if task_id not in tasks:
-        raise HTTPException(status_code=404)
-
-    task = tasks[task_id]
+    task = _task(task_id)
     if wait > 0 and not task.done.is_set():
-        try:
+        with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(task.done.wait(), timeout=min(wait, MAX_RESULT_WAIT))
-        except asyncio.TimeoutError:
-            pass
-        if task_id not in tasks:
-            raise HTTPException(status_code=404)
+        task = _task(task_id)  # it may have been cleaned up meanwhile
     if task.status == "COMPLETED":
         return Response(content=task.result, media_type="application/octet-stream")
     if task.status == "FAILED":
-        error_msg = task.result.decode("utf-8") if isinstance(task.result, bytes) else str(task.result)
-        return {"status": "FAILED", "error": error_msg}
+        return {"status": "FAILED", "error": task.result.decode("utf-8")}
     return {"status": task.status}
+
 
 def start_relay(
     port: int = 8000,
