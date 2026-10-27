@@ -39,5 +39,5 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          { echo '### Petals'; echo '```'; grep -E "RESULT|KILLED|prompt" petals.txt || true; echo '```';
+          { echo '### Petals'; echo '```'; grep -E "RESULT|KILLED|prompt|Route found|Caught exception" petals.txt | cut -c1-200 || true; echo '```';
             cat /tmp/distllm-loopback.md /tmp/distllm-network.md 2>/dev/null; } >> "$GITHUB_STEP_SUMMARY"

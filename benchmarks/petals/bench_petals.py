@@ -41,7 +41,7 @@ for run in range(3 if mode == "speed" else 1):
 
         def kill():
             os.kill(pid, signal.SIGKILL)
-            print(f"KILLED server pid {pid} at +3 s", flush=True)
+            print(f"KILLED server {sys.argv[2]} (pid {pid}) at +3 s", flush=True)
 
         threading.Timer(3.0, kill).start()
     started = time.perf_counter()
