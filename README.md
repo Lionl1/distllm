@@ -47,7 +47,7 @@ client: tokenizer ───► │              │ ─────────�
 - **Spot checks** against a trusted copy of the stages name a stage that computes wrongly.
 - **One model version everywhere**: stages pin the Hub commit (`revision`), so every machine
   loads the same weights; pinned models load offline from the cache.
-- **Bearer-token auth** for clients and workers, tensors on the wire in their own dtype.
+- **Bearer-token auth** for clients and workers with rotation without downtime, tensors on the wire in their own dtype.
 - **Two relays, one protocol**: Python, or a single Rust binary with a few MB of RAM.
 
 The full design: [docs/architecture.md](docs/architecture.md).

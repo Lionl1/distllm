@@ -6,10 +6,12 @@ import httpx
 import functools
 from collections import OrderedDict
 from typing import Callable, Optional
+from .auth import first_token
 from .crypto import RID_KEY, PayloadDecryptionError, cipher_from, is_sealed
 from .transport import pack_payload, unpack_payload
 
-def _auth_headers(token: Optional[str]) -> dict:
+def _auth_headers(spec: Optional[str]) -> dict:
+    token = first_token(spec)  # a spec may list several tokens or name a file
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 

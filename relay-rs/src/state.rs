@@ -1,6 +1,7 @@
 //! Relay state: nodes, tasks, queues, session affinity — the same rules as the
 //! Python relay (src/distllm/relay.py).
 
+use crate::auth::TokenSet;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -19,8 +20,8 @@ pub const STOP_CHAIN_SNIFF_LIMIT: usize = 4096;
 pub const MAX_ERROR_LENGTH: usize = 8000;
 
 pub struct Settings {
-    pub client_token: Option<String>,
-    pub worker_token: Option<String>,
+    pub client_token: Option<TokenSet>,
+    pub worker_token: Option<TokenSet>,
     pub worker_rtt: Duration,
     pub client_rtt: Duration,
     /// An assigned task without a result for this long is re-queued.
