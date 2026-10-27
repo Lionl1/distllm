@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Petals vs distllm on one Linux runner (`.github/workflows/bench-petals.yml`,
+  `benchmarks/petals/`): speed, exactness and a killed replica; Petals needs its
+  dependencies pinned to early 2024.
 - Token rotation without downtime (both relays): a token setting may be `new,old` (any is
   accepted) or `@file`, re-read when it changes; clients and workers send the first token.
 - Relay restart without recomputation: workers re-register with the sessions they hold
