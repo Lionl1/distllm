@@ -119,6 +119,10 @@ So:
   a mismatch stops generation with `VerificationError` naming the stage that computes
   differently. It catches a broken or cheating stage at the cost of occasional full
   prefills; it does not make a pipeline of strangers trustworthy.
+- **Hide traffic from the relay:** `export DISTLLM_PAYLOAD_KEY=$(distllm keygen)` on your
+  machine and give the same value to every worker (`pip install distllm[encryption]`).
+  Prompts, hidden states and tokens then cross the relay and the tunnel encrypted; the relay
+  host learns only who talks to whom, when and how much. Workers still see what they compute.
 - Tokens are bearer secrets: share them over a private channel, rotate them when someone
   leaves, use HTTPS or a private network.
 

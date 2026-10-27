@@ -5,10 +5,19 @@ import time
 import httpx
 import functools
 from typing import Callable, Optional
+from .crypto import RID_KEY, PayloadDecryptionError, cipher_from, is_sealed
 from .transport import pack_payload, unpack_payload
 
 def _auth_headers(token: Optional[str]) -> dict:
     return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _open(cipher, data: bytes) -> bytes:
+    if cipher:
+        return cipher.open(data)
+    if is_sealed(data):
+        raise PayloadDecryptionError("Payload is encrypted: set DISTLLM_PAYLOAD_KEY")
+    return data
 
 
 class RelayAuthError(PermissionError):
@@ -30,11 +39,13 @@ class Worker:
         max_batch: int = 1,
         batched: bool = False,
         heartbeat_interval: Optional[float] = None,
+        payload_key: Optional[str] = None,
     ):
         """``max_batch > 1`` takes up to that many queued tasks per poll. With
         ``batched=True`` the function receives a list of payloads and returns a list of
         results (an Exception instance marks a failed item); otherwise the tasks run one
-        by one."""
+        by one. ``payload_key`` (else ``$DISTLLM_PAYLOAD_KEY``) turns on end-to-end
+        encryption of payloads; clients and workers must share it."""
         self.role = role
         self.max_batch = max(1, max_batch)
         self.batched = batched
@@ -50,6 +61,14 @@ class Worker:
         token = token or os.environ.get("DISTLLM_WORKER_TOKEN") or os.environ.get("DISTLLM_TOKEN")
         # High timeout for unstable tunnels
         self.client = httpx.AsyncClient(timeout=120.0, headers=_auth_headers(token))
+        self.cipher = cipher_from(payload_key)
+
+    def _decode(self, data: bytes):
+        """A task payload, or the exception that makes it unusable (reported as the task's failure)."""
+        try:
+            return unpack_payload(_open(self.cipher, data))
+        except Exception as e:
+            return e
 
     async def register(self):
         """Registers the worker node with the relay, retrying if necessary."""
@@ -83,6 +102,15 @@ class Worker:
 
     async def _process(self, func: Callable, tasks: list) -> None:
         """Run tasks (one, or a batch with ``batched=True``) and upload every outcome."""
+        # Payloads that could not be decoded fail on their own; the rest run.
+        bad = {task_id: payload for task_id, payload in tasks if isinstance(payload, Exception)}
+        if bad:
+            await asyncio.gather(*(self._report(task_id, error) for task_id, error in bad.items()))
+            tasks = [(task_id, payload) for task_id, payload in tasks if task_id not in bad]
+            if not tasks:
+                return
+        # Encrypted requests carry an id that the result must echo (see Cluster.wait_for).
+        rids = {task_id: payload.pop(RID_KEY, None) for task_id, payload in tasks if isinstance(payload, dict)}
         ids = ", ".join(task_id for task_id, _ in tasks)
         print(f"[+] Processing {ids}...")
         if self.batched:
@@ -100,13 +128,17 @@ class Worker:
                 except Exception as e:
                     results.append(e)
         await asyncio.gather(*(
-            self._report(task_id, result) for (task_id, _), result in zip(tasks, results)
+            self._report(task_id, result, rids.get(task_id)) for (task_id, _), result in zip(tasks, results)
         ))
 
-    async def _report(self, task_id: str, result) -> None:
+    async def _report(self, task_id: str, result, rid: Optional[str] = None) -> None:
+        if rid is not None and isinstance(result, dict):
+            result = {**result, RID_KEY: rid}
         if not isinstance(result, Exception):
             try:
                 body = pack_payload(result)
+                if self.cipher:
+                    body = self.cipher.seal(body)
             except Exception as e:  # unserializable result
                 result = e
         if isinstance(result, Exception):
@@ -184,7 +216,7 @@ class Worker:
                     if resp.status_code == 200:
                         data = unpack_payload(resp.content)
                         items = data["tasks"] if "tasks" in data else [data]
-                        tasks = [(item["task_id"], unpack_payload(item["payload"])) for item in items]
+                        tasks = [(item["task_id"], self._decode(item["payload"])) for item in items]
                         await self._process(func, tasks)
                     elif resp.status_code == 204:
                         pass # No tasks
@@ -226,6 +258,7 @@ def worker_node(
     token: Optional[str] = None,
     max_batch: int = 1,
     batched: bool = False,
+    payload_key: Optional[str] = None,
 ):
     """Decorator to turn a function into a distributed worker."""
     def decorator(func):
@@ -236,7 +269,7 @@ def worker_node(
         def _worker(node_id: str = None, idle_sleep: float = 0.0) -> Worker:
             return Worker(
                 role=role, relay_url=relay_url, node_id=node_id, idle_sleep=idle_sleep, token=token,
-                max_batch=max_batch, batched=batched,
+                max_batch=max_batch, batched=batched, payload_key=payload_key,
             )
 
         def start(node_id: str = None, idle_sleep: float = 0.0):
@@ -267,12 +300,27 @@ class Cluster:
     """
     LONG_POLL_WAIT = 30.0
 
-    def __init__(self, relay_url: str, poll_interval: Optional[float] = None, token: Optional[str] = None):
+    def __init__(
+        self,
+        relay_url: str,
+        poll_interval: Optional[float] = None,
+        token: Optional[str] = None,
+        payload_key: Optional[str] = None,
+    ):
+        """``payload_key`` (else ``$DISTLLM_PAYLOAD_KEY``): encrypt payloads end to end."""
         self.relay_url = relay_url.rstrip("/")
         token = token or os.environ.get("DISTLLM_TOKEN")
         self.client = httpx.AsyncClient(timeout=120.0, headers=_auth_headers(token))
+        self.cipher = cipher_from(payload_key)
         self.node_id = "client-" + str(uuid.uuid4())[:8]
         self.poll_interval = poll_interval
+        self._rids = {}  # task_id -> request id expected back in the sealed result
+
+    def _check_rid(self, task_id: str, result):
+        expected = self._rids.pop(task_id, None)
+        if expected is not None and (not isinstance(result, dict) or result.pop(RID_KEY, None) != expected):
+            raise PayloadDecryptionError(f"Result of task {task_id} belongs to another request (replayed?)")
+        return result
 
     async def __aenter__(self):
         return self
@@ -295,7 +343,15 @@ class Cluster:
         up to SUBMIT_RETRY_FOR seconds; a duplicate submission is harmless because stages
         check start_pos.
         """
+        rid = None
+        if self.cipher and isinstance(payload, dict):
+            # Sealed with the request and echoed sealed by every stage of a route: the relay
+            # cannot answer this request with a (validly encrypted) result of another one.
+            rid = uuid.uuid4().hex
+            payload = {**payload, RID_KEY: rid}
         data = pack_payload(payload)
+        if self.cipher:
+            data = self.cipher.seal(data)
         params = {"target_role": role, "sender_id": self.node_id}
         if route:
             params["route"] = ",".join(route)
@@ -321,7 +377,10 @@ class Cluster:
         if resp.status_code == 401:
             raise RelayAuthError("Relay rejected the client token (set DISTLLM_TOKEN)")
         resp.raise_for_status()
-        return resp.json()["task_id"]
+        task_id = resp.json()["task_id"]
+        if rid:
+            self._rids[task_id] = rid
+        return task_id
 
     async def wait_for(self, task_id: str, timeout: float = 60.0) -> dict:
         """Waits for the result of a task (long-poll by default)."""
@@ -346,7 +405,7 @@ class Cluster:
                     continue
                 if resp.status_code == 200:
                     if resp.headers.get("content-type") == "application/octet-stream":
-                        return unpack_payload(resp.content)
+                        return self._check_rid(task_id, unpack_payload(_open(self.cipher, resp.content)))
                     try:
                         data = resp.json()
                     except ValueError:

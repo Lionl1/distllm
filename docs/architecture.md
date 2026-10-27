@@ -95,6 +95,31 @@ time. Separate tokens mean a worker notebook cannot submit tasks and a client ca
 register as a stage and read hidden states. Without tokens the relay is open and warns
 when bound to a public interface. Use an HTTPS tunnel — the token is a bearer secret.
 
+### End-to-end payload encryption (`crypto.py`)
+
+With `DISTLLM_PAYLOAD_KEY` set on the client and every worker (or `payload_key=` on
+`Cluster`/`Worker`/`worker_node`), each task payload and result is sealed with
+ChaCha20-Poly1305 before it leaves the process: `b"DLE1" | 12-byte nonce | ciphertext+tag`.
+The relay — and whoever runs it, or sits on a plain-HTTP tunnel — sees roles, session ids,
+sizes and timing, but not prompts, hidden states or tokens, and cannot alter a payload
+without failing authentication. It does not need the key and is unchanged (`stop_chain`
+travels as a URL flag; a sealed body never parses as a msgpack dict).
+
+- Key: `distllm keygen` (32 random bytes, base64url) or a passphrase of 12+ characters
+  (scrypt with a fixed salt, so all nodes derive the same key).
+- Mismatches fail fast instead of hanging: a worker without the key, or with a different
+  one, fails the task with `PayloadDecryptionError`; a side with the key refuses plaintext,
+  so the relay cannot inject unencrypted payloads.
+- Not hidden from **workers**: a stage must decrypt its input to compute. Encryption
+  protects against the relay and the network, not against a stage you do not trust (see
+  the privacy notes in self-hosted.md and auditing).
+- The relay can still drop or delay sealed messages. Replays do not pass: the client seals a
+  random request id into each payload, every stage echoes it in its sealed result, and a
+  result with another id is rejected (`PayloadDecryptionError`). A replayed *task* can only
+  reset or rewind a stage's cache, which the next step detects as `cache_miss` and repairs
+  with a prefix replay — the output stays correct.
+- Cost: ~0.7 GiB/s on an M1 core, 0.08 ms for a 65 KiB hidden state.
+
 ### Latency simulation
 
 `start_relay(worker_rtt_ms=..., client_rtt_ms=...)` / `distllm relay

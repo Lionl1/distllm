@@ -47,7 +47,11 @@ Changelog = "https://github.com/Lionl1/distllm/blob/main/CHANGELOG.md"
 quantization = [
     "bitsandbytes>=0.46.0",
 ]
+encryption = [
+    "cryptography>=42.0.0",
+]
 test = [
+    "cryptography>=42.0.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
