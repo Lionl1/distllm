@@ -3,8 +3,6 @@ name: bench-petals
 # Manual comparison run: Petals and distllm on the same Linux runner (CPU).
 on:
   workflow_dispatch:
-  push:
-    branches: [bench/petals-linux]
 
 jobs:
   compare:

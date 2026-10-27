@@ -226,5 +226,9 @@ Same model (SmolLM2-360M, float32, CPU), same machine, two nodes, 48 tokens
   SIGABRT) and the generation is lost; distllm finishes it with identical tokens on another
   worker (the chaos tests). llama.cpp RPC also needs the client to reach every node directly
   (no NAT traversal) and has no authentication; its README warns against exposing it.
-- **Petals** 2.2 (last release 2023) needs torch 2.1; on macOS arm64 its inference sessions
-  were reset by the server, so there are no numbers yet — to be rerun on Linux.
+- **Petals** 2.2 (last release 2023), on one Linux runner next to distllm (CPU, 2 nodes,
+  loopback): 8.6–8.8 tokens/s against distllm's 10.3, both exact. Killing the replica that
+  serves the session, Petals keeps retrying the dead server and does not finish within
+  5 minutes; distllm finishes after its node timeout. A plain `pip install petals` today
+  gets dependencies under which every inference session breaks; it works pinned to early
+  2024 (`.github/workflows/bench-petals.yml`).

@@ -27,8 +27,28 @@ Prompt processing (37 tokens): llama.cpp 375 t/s single, 336 t/s over RPC, 148 t
 
 ## Petals
 
-Petals 2.2.0.post1 (last release, 2023) needs Python ≤ 3.11 and torch 2.1 (it fails to import
-with current torch). On macOS arm64 a private two-server swarm started and a plain forward pass
-worked, but every inference session (`rpc_inference`, which `generate` uses) was reset by the
-server before the handler ran — with the default `spawn` start method and with `fork` forced.
-No speed numbers; needs a Linux/CUDA rerun.
+Petals 2.2.0.post1 (last release, 2023) on one GitHub Actions Linux runner (x86, 4 vCPU),
+next to distllm on the same runner (`.github/workflows/bench-petals.yml`,
+`benchmarks/petals/`): CPU, float32, blocks 0:16 on one server and two replicas of 16:32,
+same prompt (37 tokens), 48 tokens, loopback.
+
+| tokens/s | Petals | distllm |
+|---|---:|---:|
+| one process | — | 12.2 |
+| 2 nodes, loopback | 8.6–8.8 | 9.9 (route 10.3) |
+| 2 nodes, 60 ms RTT (distllm: relay simulation) | not measured | 3.8 (route 4.1, speculative k=6 6.4) |
+
+Both produce the same tokens as transformers.
+
+**A server dies** (SIGKILL 3 s into a 96-token generation): killing the idle replica changes
+nothing; killing the replica that serves the session, Petals keeps retrying the dead server
+(its DHT record is still valid), finds the live replica after ~4 minutes and does not finish
+the generation within the 5-minute limit. distllm detects a dead worker after its node
+timeout (30 s by default, 3 s in the chaos tests) and finishes with the same tokens.
+
+**Installing it today:** `pip install petals` resolves current dependencies (protobuf 7):
+servers start and plain forward passes work, but every inference session is reset before
+the server handler runs — also with Petals' own CI model `Maykeye/TinyLLama-v0`, on Linux
+and macOS. It works with everything resolved as of early 2024
+(`uv pip install --exclude-newer 2024-02-01`, torch 2.1.2, hivemind built with
+`grpcio-tools<1.61`, `protobuf<4.26`).

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Petals vs distllm on one Linux runner (`.github/workflows/bench-petals.yml`,
+  `benchmarks/petals/`): speed, exactness and a killed replica; Petals needs its
+  dependencies pinned to early 2024.
 - Relay restart without recomputation: workers re-register with the sessions they hold
   (`/register?sessions=`, both relays) so session affinity survives, and the generator
   resends a lost step with `rewind` instead of replaying the prefix.
