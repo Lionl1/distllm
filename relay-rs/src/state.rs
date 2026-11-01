@@ -2,7 +2,7 @@
 //! Python relay (src/distllm/relay.py).
 
 use crate::auth::TokenSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -362,6 +362,62 @@ impl Relay {
             eprintln!("Node {node_id} ({}) deregistered gracefully.", node.role);
             g.forget_worker(node_id);
         }
+    }
+
+    /// Workers, pending tasks per role and tasks by status, as `GET /status` returns them.
+    pub fn status(&self) -> serde_json::Value {
+        let g = self.lock();
+        let mut counts: BTreeMap<&str, usize> = [
+            Status::Pending,
+            Status::Assigned,
+            Status::Forwarded,
+            Status::Completed,
+            Status::Failed,
+        ]
+        .iter()
+        .map(|s| (s.as_str(), 0))
+        .collect();
+        let mut roles: BTreeMap<&str, (usize, usize)> = BTreeMap::new(); // workers, pending
+        for node in g.nodes.values() {
+            roles.entry(&node.role).or_default().0 += 1;
+        }
+        for task in g.tasks.values() {
+            *counts.entry(task.status.as_str()).or_default() += 1;
+            if task.status == Status::Pending {
+                roles.entry(&task.target_role).or_default().1 += 1;
+            }
+        }
+        let mut nodes: Vec<(&String, &Node)> = g.nodes.iter().collect();
+        nodes.sort_by(|a, b| (&a.1.role, a.0).cmp(&(&b.1.role, b.0)));
+        let nodes: Vec<serde_json::Value> = nodes
+            .into_iter()
+            .map(|(id, node)| {
+                let assigned = g
+                    .tasks
+                    .values()
+                    .filter(|t| t.status == Status::Assigned && t.worker_id.as_ref() == Some(id))
+                    .count();
+                let sessions = g.affinity.values().filter(|(w, _)| w == id).count();
+                let age = node.last_heartbeat.elapsed().as_secs_f64();
+                serde_json::json!({
+                    "node_id": id,
+                    "role": node.role,
+                    "last_heartbeat_s": (age * 1000.0).round() / 1000.0,
+                    "assigned": assigned,
+                    "sessions": sessions,
+                })
+            })
+            .collect();
+        let roles: serde_json::Map<String, serde_json::Value> = roles
+            .into_iter()
+            .map(|(role, (workers, pending))| {
+                (
+                    role.to_string(),
+                    serde_json::json!({ "workers": workers, "pending": pending }),
+                )
+            })
+            .collect();
+        serde_json::json!({ "nodes": nodes, "roles": roles, "tasks": counts })
     }
 
     pub fn heartbeat(&self, node_id: &str) -> bool {

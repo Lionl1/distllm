@@ -86,6 +86,11 @@ uv run python examples/distributed_hf/client_hf.py --model-id Qwen/Qwen2.5-0.5B 
 # than the target, e.g. target Qwen/Qwen2.5-7B with --draft-model-id Qwen/Qwen2.5-0.5B
 ```
 
+Watch the pool in a browser at the relay's address (`http://RELAY:8000/`): workers and
+their last heartbeat, pending tasks per role (a role without workers shows red), tasks by
+status. Enter `DISTLLM_TOKEN` there; with the worker token the page can also drop a worker
+(its tasks are re-queued, its sessions move to other replicas).
+
 Workers pick CUDA when available (bf16 for bf16 checkpoints on Ampere+, fp16 otherwise),
 then Apple Silicon GPUs (MPS, fp16), then CPU (float32); `--device`, `--dtype` and
 `--quantize nf4|fp4|int8` override it (quantization needs CUDA or CPU).

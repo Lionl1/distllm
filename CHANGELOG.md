@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Web status page at `/` on both relays: workers (last heartbeat, running tasks,
+  sessions), pending tasks per role, tasks by status, refreshed every 2 s; a worker can be
+  dropped from it (needs the worker token). Backed by `GET /status` (client token).
 - Petals vs distllm on one Linux runner (`.github/workflows/bench-petals.yml`,
   `benchmarks/petals/`): speed, exactness and a killed replica; Petals needs its
   dependencies pinned to early 2024.

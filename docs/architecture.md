@@ -43,6 +43,8 @@ integration tests run against either (`DISTLLM_TEST_RELAY=rust`).
 | `POST /fail/{task_id}?worker_id` | worker | body = error message (text, ≤ 8000 chars kept) |
 | `POST /submit?target_role&sender_id&route&session` | client | body = msgpack payload; returns `{task_id}` |
 | `GET /get_result/{task_id}?wait` | client | long-poll (≤ 60 s): msgpack result, `{"status": "FAILED", "error"}`, or `{"status": ...}` while pending |
+| `GET /status` | client | JSON: `nodes` (id, role, seconds since heartbeat, running tasks, sessions), `roles` (workers, pending), `tasks` by status |
+| `GET /` | — | the web status page (no token; its requests carry the token typed into it) |
 
 ### Task lifecycle
 

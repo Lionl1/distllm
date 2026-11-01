@@ -5,12 +5,13 @@ import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import msgpack
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from .auth import TokenSet
 from .transport import pack_payload
@@ -69,6 +70,8 @@ def set_auth_tokens(token: Optional[str] = None, worker_token: Optional[str] = N
 
 @app.middleware("http")
 async def require_token(request: Request, call_next):
+    if request.url.path == "/":  # the status page itself is public; its API calls carry the token
+        return await call_next(request)
     expected = auth_tokens[_side(request.url.path)]
     if expected.enabled:
         scheme, _, value = request.headers.get("authorization", "").partition(" ")
@@ -417,6 +420,42 @@ async def post_failure(task_id: str, request: Request, error_msg: Optional[str] 
     body = (await request.body()).decode("utf-8", errors="replace")
     _finish(task, "FAILED", (body or error_msg or "unknown error")[:MAX_ERROR_LENGTH].encode())
     return {"status": "ok"}
+
+
+@app.get("/status")
+async def status():
+    """What the relay sees: workers, pending tasks per role, tasks by status (the web UI)."""
+    now = time.time()
+    counts = {s: 0 for s in ("PENDING", "ASSIGNED", "FORWARDED", "COMPLETED", "FAILED")}
+    roles: Dict[str, dict] = {}
+    for node in nodes.values():
+        roles.setdefault(node.role, {"workers": 0, "pending": 0})["workers"] += 1
+    for task in tasks.values():
+        counts[task.status] += 1
+        if task.status == "PENDING":
+            roles.setdefault(task.target_role, {"workers": 0, "pending": 0})["pending"] += 1
+    return {
+        "nodes": [
+            {
+                "node_id": node.node_id,
+                "role": node.role,
+                "last_heartbeat_s": round(now - node.last_heartbeat, 3),
+                "assigned": sum(t.status == "ASSIGNED" and t.worker_id == node.node_id for t in tasks.values()),
+                "sessions": sum(w == node.node_id for w, _ in affinity.values()),
+            }
+            for node in sorted(nodes.values(), key=lambda n: (n.role, n.node_id))
+        ],
+        "roles": dict(sorted(roles.items())),
+        "tasks": counts,
+    }
+
+
+UI_PAGE = (Path(__file__).parent / "ui.html").read_text(encoding="utf-8")
+
+
+@app.get("/", include_in_schema=False)
+async def ui():
+    return HTMLResponse(UI_PAGE)
 
 
 @app.get("/get_result/{task_id}")
