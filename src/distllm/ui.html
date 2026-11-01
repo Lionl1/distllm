@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>distllm relay</title>
+<style>
+  :root { --bg: #fafafa; --fg: #1d1d1f; --muted: #6e6e73; --line: #e2e2e5; --card: #fff;
+          --ok: #1a7f37; --bad: #c62828; --wait: #9a6700; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161618; --fg: #ececee; --muted: #9a9aa0; --line: #2e2e33; --card: #1e1e21;
+            --ok: #4cc26a; --bad: #ef6a6a; --wait: #d6a531; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 system-ui, -apple-system, sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 16px; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+            padding: 12px; margin-bottom: 16px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  input, button { font: inherit; color: inherit; background: var(--bg);
+                  border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .wait { color: var(--wait); }
+  .muted { color: var(--muted); }
+  #status { margin-left: auto; }
+  .counts { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+  .counts b { font-size: 18px; display: block; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>distllm relay</h1>
+    <input id="token" type="password" placeholder="client token (DISTLLM_TOKEN)" size="26">
+    <input id="worker-token" type="password" placeholder="worker token, to drop workers" size="26">
+    <span id="status" class="muted"></span>
+  </header>
+
+  <section>
+    <h2>Tasks</h2>
+    <div id="tasks" class="counts"></div>
+  </section>
+
+  <section>
+    <h2>Roles</h2>
+    <table>
+      <thead><tr><th>Role</th><th>Workers</th><th>Pending tasks</th></tr></thead>
+      <tbody id="roles"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Workers</h2>
+    <table>
+      <thead><tr><th>Node</th><th>Role</th><th>Last heartbeat</th><th>Running</th><th>Sessions</th><th></th></tr></thead>
+      <tbody id="nodes"></tbody>
+    </table>
+    <p class="muted">Drop: the relay forgets the worker, re-queues its tasks and moves its sessions to
+      other replicas (their KV caches are rebuilt). A live worker registers again on its next heartbeat.</p>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+for (const id of ["token", "worker-token"]) {
+  try { $(id).value = localStorage.getItem("distllm-" + id) || ""; } catch {}
+  $(id).addEventListener("change", () => {
+    try { localStorage.setItem("distllm-" + id, $(id).value); } catch {}
+    refresh();
+  });
+}
+
+async function api(path, token, opts = {}) {
+  const headers = token ? { authorization: "Bearer " + token } : {};
+  const r = await fetch(path, Object.assign({ headers }, opts));
+  if (!r.ok) throw new Error(r.status + " " + (await r.text()));
+  return r.json();
+}
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const taskCls = { PENDING: "wait", FAILED: "bad", COMPLETED: "ok" };
+
+async function refresh() {
+  try {
+    const s = await api("/status", $("token").value);
+    $("tasks").innerHTML = Object.entries(s.tasks)
+      .map(([k, v]) => `<div><b class="${taskCls[k] || ""}">${v}</b><span class="muted">${k.toLowerCase()}</span></div>`).join("");
+    $("roles").innerHTML = Object.entries(s.roles).map(([role, r]) =>
+      `<tr><td>${esc(role)}</td><td class="${r.workers ? "" : "bad"}">${r.workers}</td><td>${r.pending}</td></tr>`).join("")
+      || `<tr><td colspan="3" class="muted">No roles yet.</td></tr>`;
+    $("nodes").innerHTML = s.nodes.map((n) => {
+      const age = n.last_heartbeat_s;
+      return `<tr><td class="mono">${esc(n.node_id)}</td><td>${esc(n.role)}</td>
+        <td class="${age > 15 ? "bad" : ""}">${age.toFixed(1)} s ago</td><td>${n.assigned}</td><td>${n.sessions}</td>
+        <td><button data-node="${esc(n.node_id)}">Drop</button></td></tr>`;
+    }).join("") || `<tr><td colspan="6" class="muted">No workers: start one with Cluster / distllm worker.</td></tr>`;
+    $("status").textContent = "updated " + new Date().toLocaleTimeString();
+    $("status").className = "muted";
+  } catch (e) {
+    $("status").textContent = e.message.startsWith("401") ? "wrong or missing token" : e.message;
+    $("status").className = "bad";
+  }
+}
+
+$("nodes").addEventListener("click", async (ev) => {
+  const node = ev.target.dataset.node;
+  if (!node || !confirm("Drop worker " + node + "?")) return;
+  try {
+    await api("/deregister?node_id=" + encodeURIComponent(node), $("worker-token").value || $("token").value, { method: "POST" });
+    refresh();
+  } catch (e) {
+    $("status").textContent = "drop failed: " + e.message;
+    $("status").className = "bad";
+  }
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

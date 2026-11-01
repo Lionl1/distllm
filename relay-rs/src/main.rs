@@ -20,7 +20,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use clap::Parser;
 use serde_json::json;
@@ -145,6 +145,10 @@ fn parse_num<T: std::str::FromStr>(
 // ---------------------------------------------------------------------------
 
 async fn require_token(State(relay): State<Shared>, request: Request, next: Next) -> Response {
+    if request.uri().path() == "/" {
+        // The status page itself is public; its API calls carry the token.
+        return next.run(request).await;
+    }
     let worker = is_worker_path(request.uri().path());
     let expected = if worker {
         &relay.settings.worker_token
@@ -358,6 +362,16 @@ async fn get_result(
     }
 }
 
+/// What the relay sees: workers, pending tasks per role, tasks by status (the web UI).
+async fn status(State(relay): State<Shared>) -> Response {
+    json_response(StatusCode::OK, relay.status())
+}
+
+/// The same page as the Python relay's.
+async fn ui() -> Html<&'static str> {
+    Html(include_str!("../../src/distllm/ui.html"))
+}
+
 // ---------------------------------------------------------------------------
 
 fn app(relay: Shared) -> Router {
@@ -370,6 +384,8 @@ fn app(relay: Shared) -> Router {
         .route("/fail/{task_id}", post(post_failure))
         .route("/submit", post(submit))
         .route("/get_result/{task_id}", get(get_result))
+        .route("/status", get(status))
+        .route("/", get(ui))
         .fallback(|| async { not_found() })
         // Prefill hidden states of big models are tens of MB: no body limit.
         .layer(DefaultBodyLimit::disable())

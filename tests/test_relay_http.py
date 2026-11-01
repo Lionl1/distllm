@@ -237,6 +237,31 @@ def test_auth(relay_factory):
                   headers={"Authorization": "client-t"}).status_code == 401
 
 
+def test_status_and_ui(relay_factory):
+    c = relay_factory(token="client-t", worker_token="worker-t")
+    client, worker = {"Authorization": "Bearer client-t"}, {"Authorization": "Bearer worker-t"}
+    page = c.get("/")
+    assert page.status_code == 200 and "<title>distllm relay</title>" in page.text
+    assert c.get("/status").status_code == 401
+    assert c.get("/status", headers=worker).status_code == 401
+    for node in ("w2", "w1"):
+        c.post("/register", params={"node_id": node, "role": "stage0"}, headers=worker)
+    body = pack_payload({})
+    for _ in range(2):
+        c.post("/submit", content=body, params={"target_role": "stage1", "sender_id": "c"}, headers=client)
+    c.post("/submit", content=body, params={"target_role": "stage0", "sender_id": "c", "session": "s"}, headers=client)
+    assert "task_id" in unpack_payload(c.get("/poll/stage0", params={"worker_id": "w1"}, headers=worker).content)
+    s = c.get("/status", headers=client).json()
+    assert [(n["node_id"], n["role"], n["assigned"], n["sessions"]) for n in s["nodes"]] == [
+        ("w1", "stage0", 1, 1), ("w2", "stage0", 0, 0)]
+    assert all(0 <= n["last_heartbeat_s"] < 10 for n in s["nodes"])
+    assert s["roles"] == {"stage0": {"workers": 2, "pending": 0}, "stage1": {"workers": 0, "pending": 2}}
+    assert s["tasks"] == {"PENDING": 2, "ASSIGNED": 1, "FORWARDED": 0, "COMPLETED": 0, "FAILED": 0}
+    c.post("/deregister", params={"node_id": "w1"}, headers=worker)
+    s = c.get("/status", headers=client).json()
+    assert [n["node_id"] for n in s["nodes"]] == ["w2"] and s["tasks"]["PENDING"] == 3
+
+
 def test_simulated_latency(relay_factory):
     c = relay_factory(worker_rtt_ms=200)
     started = time.perf_counter()
