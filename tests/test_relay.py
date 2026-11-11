@@ -322,6 +322,31 @@ def test_failure_message_in_body_and_truncated():
     assert error.startswith("Traceback") and len(error) <= 8000
 
 
+def test_result_sniffing_never_unpickles(monkeypatch):
+    # The relay parses small result bodies from workers. With msgpack-numpy patched in,
+    # this body ran code inside the relay process.
+    import os
+    import pickle
+
+    import msgpack
+
+    import distllm.relay as relay
+
+    monkeypatch.delenv("DISTLLM_PWNED", raising=False)
+
+    class Payload:
+        def __reduce__(self):
+            return (exec, ("import os; os.environ['DISTLLM_PWNED'] = '1'",))
+
+    evil = msgpack.packb(
+        {b"nd": True, b"type": [], b"kind": b"O", b"shape": [1], b"data": pickle.dumps(Payload())},
+        use_bin_type=True,
+    )
+    assert len(evil) <= relay.STOP_CHAIN_SNIFF_LIMIT
+    assert relay._stops_chain(evil, False) is False
+    assert "DISTLLM_PWNED" not in os.environ
+
+
 def test_stop_chain_flag_and_large_bodies_not_decoded(monkeypatch):
     import distllm.relay as relay
 

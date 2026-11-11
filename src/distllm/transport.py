@@ -1,10 +1,11 @@
 import msgpack
-import msgpack_numpy as m
 import numpy as np
 import torch
 
-# Patches msgpack to support numpy arrays
-m.patch()
+# msgpack-numpy is not used here on purpose. Its decoder unpickles object arrays
+# (`pickle.loads` on bytes from the network), and `msgpack_numpy.patch()` put that decoder
+# into every `msgpack.unpackb` of the process, so any peer could run code on the relay,
+# the workers and the clients. The old numpy wire format is read by `_decode_legacy_array`.
 
 # Tensors travel as raw bytes in their own dtype (fp16/bf16 stay 2 bytes per value).
 # The old format converted everything through numpy, which turned bf16 into float32
@@ -25,6 +26,33 @@ def _encode_tensor(tensor: torch.Tensor) -> dict:
         raise TypeError(f"Unsupported tensor dtype for transport: {tensor.dtype}")
     data = tensor.reshape(-1).view(torch.uint8).numpy().tobytes() if tensor.numel() else b""
     return {"__tensor__": True, "dtype": dtype, "shape": list(tensor.shape), "data": data}
+
+
+def _decode_legacy_array(obj: dict) -> np.ndarray:
+    """A numpy array as msgpack-numpy wrote it: {b"nd", b"type", b"kind", b"shape", b"data"}.
+
+    Only plain numbers: b"kind" marks pickled objects (b"O") and structured records (b"V"),
+    which distllm never sent.
+    """
+    descr = obj.get(b"type")
+    if isinstance(descr, bytes):
+        descr = descr.decode("ascii", "replace")
+    if obj.get(b"nd") is not True or obj.get(b"kind") or not isinstance(descr, str):
+        raise ValueError("Unsupported numpy array in payload")
+    try:
+        dtype = np.dtype(descr)
+    except TypeError as exc:
+        raise ValueError(f"Unsupported numpy dtype in payload: {descr!r}") from exc
+    if dtype.kind not in "biuf":
+        raise ValueError(f"Unsupported numpy dtype in payload: {descr!r}")
+    try:
+        return np.frombuffer(obj[b"data"], dtype=dtype).reshape(obj[b"shape"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Malformed numpy array in payload") from exc
+
+
+def _decode_legacy(obj: dict):
+    return _decode_legacy_array(obj) if b"nd" in obj else obj
 
 
 def _decode_tensor(obj: dict) -> torch.Tensor:
@@ -49,7 +77,7 @@ def pack_tensor(tensor: torch.Tensor) -> bytes:
 
 def unpack_tensor(data: bytes) -> torch.Tensor:
     """Deserializes msgpack bytes to a torch tensor."""
-    unpacked = msgpack.unpackb(data, raw=False)
+    unpacked = msgpack.unpackb(data, object_hook=_decode_legacy, raw=False)
     if isinstance(unpacked, dict) and ("data" in unpacked or "arr" in unpacked):
         return _decode_tensor(unpacked)
     # Backward compatibility with older formats (direct numpy array serialization)
@@ -61,6 +89,11 @@ def pack_payload(payload: dict) -> bytes:
     def encode(obj):
         if isinstance(obj, torch.Tensor):
             return _encode_tensor(obj)
+        # numpy values used to be packed by msgpack-numpy; arrays now arrive as tensors.
+        if isinstance(obj, np.ndarray):
+            return _encode_tensor(torch.from_numpy(np.ascontiguousarray(obj).copy()))
+        if isinstance(obj, np.generic):
+            return obj.item()
         return obj
 
     return msgpack.packb(payload, default=encode, use_bin_type=True)
@@ -69,7 +102,9 @@ def pack_payload(payload: dict) -> bytes:
 def unpack_payload(data: bytes) -> dict:
     """Unpacks msgpack bytes into a dictionary, reconstructing tensors."""
     def decode(obj):
-        if isinstance(obj, dict) and "__tensor__" in obj:
+        if b"nd" in obj:
+            return _decode_legacy_array(obj)
+        if "__tensor__" in obj:
             if "data" in obj or "arr" in obj:
                 return _decode_tensor(obj)
             # Backward compatibility

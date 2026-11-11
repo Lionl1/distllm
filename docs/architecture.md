@@ -153,6 +153,8 @@ Payloads are msgpack dicts. A tensor is encoded as
 `{"__tensor__": true, "dtype": "bfloat16", "shape": [1, 37, 896], "data": <raw bytes>}` —
 fp16/bf16 stay two bytes per value (the previous format went through float32 numpy and
 doubled the traffic; it is still decoded). Only a whitelist of dtypes is accepted.
+Decoding never unpickles: plain `msgpack` plus an explicit decoder for the old numpy maps
+(numeric dtypes only), so a body from an untrusted peer cannot run code.
 
 ## Pipeline stages (`hf.py`)
 
