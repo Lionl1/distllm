@@ -1,0 +1,48 @@
+name: Release
+# A tag vX.Y.Z publishes the package to PyPI (trusted publishing, no token stored)
+# and creates a GitHub release. Every push builds the package and checks it installs.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths: ["pyproject.toml", "src/**", ".github/workflows/release.yml"]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - name: The tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "v$(uv version --short)" = "${{ github.ref_name }}"
+      - name: The wheel carries the status page and the CLI starts
+        run: |
+          unzip -l dist/*.whl | grep -q distllm/ui.html
+          uv venv /tmp/venv
+          uv pip install --python /tmp/venv/bin/python dist/*.whl --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cpu
+          /tmp/venv/bin/distllm --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --generate-notes
