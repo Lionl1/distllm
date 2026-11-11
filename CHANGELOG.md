@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Security:** payloads are no longer decoded through `msgpack-numpy`. Its decoder
+  unpickles object arrays, and `msgpack_numpy.patch()` applied it to every
+  `msgpack.unpackb` in the process, so a crafted task or result body ran code on the relay,
+  on the workers and on the clients. The dependency is removed; the old numpy wire format
+  is still read, for numeric dtypes only.
 - Web status page at `/` on both relays: workers (last heartbeat, running tasks,
   sessions), pending tasks per role, tasks by status, refreshed every 2 s; a worker can be
   dropped from it (needs the worker token). Backed by `GET /status` (client token).

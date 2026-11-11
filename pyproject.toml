@@ -32,7 +32,6 @@ dependencies = [
     "httpx>=0.24.0",
     "typer>=0.9.0",
     "msgpack>=1.0.0",
-    "msgpack-numpy>=0.4.8",
     "numpy>=1.24.0",
     "safetensors>=0.4.0",
     "huggingface_hub>=0.24.0",

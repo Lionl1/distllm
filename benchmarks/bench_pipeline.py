@@ -133,11 +133,10 @@ def _single_process(model_id, input_ids, new_tokens, device, dtype):
 
 
 def _legacy_size(tensor: torch.Tensor) -> int:
-    import msgpack_numpy
-
-    msgpack_numpy.patch()
     arr = tensor.float().numpy()  # old format: everything through float32 numpy
-    return len(msgpack.packb({"hidden_states": {"__tensor__": True, "arr": arr, "is_bf16": True}}, use_bin_type=True))
+    # The map msgpack-numpy wrote for an array (the library itself is no longer a dependency).
+    wire = {b"nd": True, b"type": arr.dtype.str, b"kind": b"", b"shape": list(arr.shape), b"data": arr.tobytes()}
+    return len(msgpack.packb({"hidden_states": {"__tensor__": True, "arr": wire, "is_bf16": True}}, use_bin_type=True))
 
 
 def _mode(key: str) -> dict:
